@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meatboy4500 RF Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header card">
+        <h1>Meatboy4500 RF Console</h1>
+        <div class="row">
+          <select id="profileSelect"></select>
+          <button id="switchBtn">Switch Profile</button>
+          <span id="profileMsg" class="muted"></span>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>System Health</h2>
+        <div id="healthGrid" class="healthGrid"></div>
+      </section>
+
+      <section class="card">
+        <h2>Live Status</h2>
+        <div class="grid" id="statusGrid">
+          <div><span>Control Freq</span><strong id="controlFreq">-</strong></div>
+          <div><span>RSSI</span><strong id="rssi">-</strong></div>
+          <div><span>SYSID</span><strong id="sysid">-</strong></div>
+          <div><span>WACN</span><strong id="wacn">-</strong></div>
+          <div><span>NAC</span><strong id="nac">-</strong></div>
+          <div><span>Current TG</span><strong id="currentTg">-</strong></div>
+          <div><span>Last TG</span><strong id="lastTg">-</strong></div>
+          <div><span>Locked</span><strong id="locked">-</strong></div>
+          <div><span>Last Decode</span><strong id="lastDecode">-</strong></div>
+          <div><span>Updated</span><strong id="updated">-</strong></div>
+        </div>
+      </section>
+
+      <section class="card tabsWrap">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="talkgroups">Talkgroups</button>
+          <button class="tab" data-tab="builder">Profile Builder</button>
+          <button class="tab" data-tab="audio">Audio</button>
+        </div>
+
+        <div class="tabPanel active" id="tab-talkgroups">
+          <div class="toolbar">
+            <input id="tgSearch" type="search" placeholder="Search TGID or label" />
+            <select id="tgCategory"></select>
+            <label><input id="tgShowEncrypted" type="checkbox" /> Show encrypted</label>
+            <label><input id="tgFavoritesOnly" type="checkbox" /> Favorites</label>
+          </div>
+          <div class="toolbar">
+            <select id="bulkCategory"></select>
+            <button id="bulkEnableBtn">Enable Category</button>
+            <button id="bulkDisableBtn">Disable Category</button>
+            <button id="saveTgBtn">Save Talkgroups</button>
+          </div>
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>TGID</th>
+                  <th>Label</th>
+                  <th>Category</th>
+                  <th>Mode</th>
+                  <th>Enc</th>
+                  <th>Fav</th>
+                  <th>Enabled</th>
+                </tr>
+              </thead>
+              <tbody id="tgTable"></tbody>
+            </table>
+          </div>
+          <div class="pager">
+            <button id="prevPageBtn">Prev</button>
+            <span id="pageInfo" class="muted"></span>
+            <button id="nextPageBtn">Next</button>
+          </div>
+        </div>
+
+        <div class="tabPanel" id="tab-builder">
+          <div class="toolbar wrap">
+            <label>Profile
+              <select id="builderProfile">
+                <option value="AZDPS">AZDPS</option>
+                <option value="MCSO">MCSO</option>
+              </select>
+            </label>
+            <label>Label <input id="builderLabel" type="text" placeholder="Arizona DPS" /></label>
+            <label>System Name <input id="builderSystemName" type="text" placeholder="AZ DPS" /></label>
+            <label>SysID <input id="builderSysid" type="text" placeholder="123" /></label>
+            <label>WACN <input id="builderWacn" type="text" placeholder="BEE00" /></label>
+            <label>NAC <input id="builderNac" type="text" placeholder="293" /></label>
+            <label>Bandplan <input id="builderBandplan" type="text" placeholder="P25 Auto" /></label>
+            <label>Site Name <input id="builderSiteName" type="text" placeholder="Main Site" /></label>
+            <label>Control Channels (;)
+              <input id="builderControlChannels" type="text" placeholder="771.10625;771.35625" />
+            </label>
+            <label>Alternate Channels (;)
+              <input id="builderAlternateChannels" type="text" placeholder="770.85625" />
+            </label>
+          </div>
+
+          <p class="muted">CSV headers: <code>tgid,label,mode,encrypted,category,favorite,enabled</code></p>
+          <textarea id="builderCsv" rows="9" placeholder="Paste talkgroup CSV here"></textarea>
+          <div class="row">
+            <input id="builderFile" type="file" accept=".csv,.txt,.json,application/json,text/csv" />
+            <button id="previewImportBtn">Preview Import</button>
+            <button id="saveImportBtn">Save Profile + Talkgroups</button>
+            <button id="jsonImportBtn">Import from /data/profiles JSON</button>
+          </div>
+          <p id="builderMsg" class="muted"></p>
+          <div id="builderErrors" class="errorBox"></div>
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>TGID</th>
+                  <th>Label</th>
+                  <th>Mode</th>
+                  <th>Encrypted</th>
+                  <th>Category</th>
+                </tr>
+              </thead>
+              <tbody id="previewTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tabPanel" id="tab-audio">
+          <audio id="audioPlayer" controls preload="none"></audio>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

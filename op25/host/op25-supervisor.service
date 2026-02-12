@@ -1,0 +1,16 @@
+[Unit]
+Description=OP25 Profile Supervisor for RF Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/stacks/rf-console
+ExecStart=/usr/bin/python3 /opt/stacks/rf-console/op25/host/op25_supervisor.py --profiles-dir /opt/stacks/rf-console/data/profiles --runtime-dir /opt/stacks/rf-console/data/runtime
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

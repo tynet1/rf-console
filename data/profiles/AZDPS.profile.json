@@ -1,0 +1,42 @@
+{
+  "label": "AZDPS",
+  "description": "Arizona DPS (user-imported template profile)",
+  "notes": "Populate system/site and talkgroup data using Profile Builder import. This profile outputs audio to ALSA loopback for ffmpeg streaming.",
+  "system": {
+    "name": "Arizona DPS",
+    "sysid": null,
+    "wacn": null,
+    "nac": null,
+    "bandplan": "P25 Auto",
+    "sites": [
+      {
+        "name": "Import Required",
+        "nac": null,
+        "sysid": null,
+        "wacn": null,
+        "controlChannels": [],
+        "alternateChannels": [],
+        "bandplan": "P25 Auto"
+      }
+    ]
+  },
+  "command": [
+    "python3",
+    "/opt/op25/op25/gr-op25_repeater/apps/rx.py",
+    "--args",
+    "rtl",
+    "-N",
+    "LNA:47",
+    "-S",
+    "2400000",
+    "-T",
+    "{PROFILES_DIR}/AZDPS.tsv",
+    "-2",
+    "-V",
+    "-O",
+    "plughw:Loopback,0,0",
+    "-U"
+  ],
+  "updatedAt": "2026-02-12T00:00:00Z",
+  "importSource": "template"
+}

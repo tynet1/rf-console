@@ -1,0 +1,40 @@
+{
+  "updatedAt": "2026-02-12T00:00:00Z",
+  "filter": {
+    "policy": "blacklist",
+    "allow": [],
+    "deny": []
+  },
+  "entries": [
+    {
+      "tgid": 1201,
+      "label": "Dispatch A",
+      "mode": "D",
+      "encrypted": false,
+      "category": "dispatch",
+      "favorite": true,
+      "filterAction": "allow",
+      "enabled": true
+    },
+    {
+      "tgid": 1202,
+      "label": "Dispatch B",
+      "mode": "T",
+      "encrypted": false,
+      "category": "dispatch",
+      "favorite": false,
+      "filterAction": "allow",
+      "enabled": true
+    },
+    {
+      "tgid": 1299,
+      "label": "Encrypted Ops",
+      "mode": "DE",
+      "encrypted": true,
+      "category": "ops",
+      "favorite": false,
+      "filterAction": "deny",
+      "enabled": true
+    }
+  ]
+}

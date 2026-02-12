@@ -1,0 +1,40 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: rf-console-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DATA_DIR=/data
+      - STREAM_URL=http://localhost:8000/stream
+      - SWITCH_HOOK=/app/scripts/switch-profile.sh
+    volumes:
+      - ./data:/data
+
+  icecast:
+    image: moul/icecast
+    container_name: rf-console-icecast
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./icecast/icecast.xml:/etc/icecast2/icecast.xml:ro
+
+  streamer:
+    build:
+      context: ./streamer
+    container_name: rf-console-streamer
+    restart: unless-stopped
+    depends_on:
+      - icecast
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - ALSA_DEVICE=hw:Loopback,1,0
+      - ICECAST_URL=icecast://source:sourcepass@icecast:8000/stream
+      - AUDIO_BITRATE=32k
+      - AUDIO_SAMPLE_RATE=22050
+      - AUDIO_CHANNELS=1

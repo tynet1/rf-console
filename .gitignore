@@ -1,0 +1,18 @@
+# Node / JS
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn*.log
+pnpm-debug.log*
+
+# Build outputs
+dist/
+build/
+out/
+coverage/
+
+# OS junk
+.DS_Store
+
+# Runtime/state
+data/runtime/*

@@ -1,0 +1,30 @@
+{
+  "updatedAt": "2026-02-12T00:00:00Z",
+  "filter": {
+    "policy": "blacklist",
+    "allow": [],
+    "deny": [3499]
+  },
+  "entries": [
+    {
+      "tgid": 3401,
+      "label": "Sheriff Dispatch",
+      "mode": "D",
+      "encrypted": false,
+      "category": "dispatch",
+      "favorite": true,
+      "filterAction": "allow",
+      "enabled": true
+    },
+    {
+      "tgid": 3499,
+      "label": "Encrypted Ops",
+      "mode": "DE",
+      "encrypted": true,
+      "category": "ops",
+      "favorite": false,
+      "filterAction": "deny",
+      "enabled": true
+    }
+  ]
+}
