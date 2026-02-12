@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { Buffer } = require('buffer');
 
 const app = express();
 
@@ -12,10 +12,13 @@ const RUNTIME_DIR = path.join(DATA_DIR, 'runtime');
 const ACTIVE_PROFILE_FILE = path.join(RUNTIME_DIR, 'active-profile.json');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'op25-status.json');
 const RELOAD_FILE = path.join(RUNTIME_DIR, 'reload-request.json');
-const SWITCH_HOOK = process.env.SWITCH_HOOK || '';
 const STREAM_URL = process.env.STREAM_URL || 'http://localhost:8000/stream';
 const ICECAST_STATUS_URL = process.env.ICECAST_STATUS_URL || 'http://icecast:8000/status-json.xsl';
-const OP25_SYSTEMD_SERVICE = process.env.OP25_SYSTEMD_SERVICE || 'op25-supervisor.service';
+
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const CONTROL_PRIVATE_ONLY = process.env.CONTROL_PRIVATE_ONLY !== '0';
+const HOST_HELPER_URL = process.env.HOST_HELPER_URL || '';
+const HOST_HELPER_TOKEN = process.env.HOST_HELPER_TOKEN || ADMIN_TOKEN;
 
 const PROFILE_OPTIONS = new Set(['AZDPS', 'MCSO']);
 
@@ -24,8 +27,8 @@ function ensureDirs() {
   fs.mkdirSync(RUNTIME_DIR, { recursive: true });
 }
 
-function isSafeProfileName(name) {
-  return typeof name === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(name);
+function nowIso() {
+  return new Date().toISOString();
 }
 
 function readJson(filePath, fallback) {
@@ -38,6 +41,10 @@ function readJson(filePath, fallback) {
 
 function writeJson(filePath, value) {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + '\n', 'utf8');
+}
+
+function isSafeProfileName(name) {
+  return typeof name === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(name);
 }
 
 function profileFile(profileName) {
@@ -54,9 +61,7 @@ function filterFile(profileName) {
 
 function listProfiles() {
   const files = fs.readdirSync(PROFILES_DIR).filter((f) => f.endsWith('.profile.json'));
-  return files
-    .map((f) => f.replace(/\.profile\.json$/, ''))
-    .filter((name) => isSafeProfileName(name));
+  return files.map((f) => f.replace(/\.profile\.json$/, '')).filter((name) => isSafeProfileName(name));
 }
 
 function activeProfile() {
@@ -67,34 +72,6 @@ function activeProfile() {
   return state.profile;
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function runSwitchHook(profile) {
-  if (!SWITCH_HOOK) {
-    return;
-  }
-
-  const child = spawn(SWITCH_HOOK, [profile], {
-    detached: true,
-    stdio: 'ignore',
-    shell: true
-  });
-  child.unref();
-}
-
-function triggerOp25Reload(reason, profile = activeProfile()) {
-  writeJson(RELOAD_FILE, {
-    requestedAt: nowIso(),
-    reason,
-    profile: profile || null
-  });
-  if (profile) {
-    runSwitchHook(profile);
-  }
-}
-
 function clampText(value, max = 128) {
   if (typeof value !== 'string') {
     return '';
@@ -102,7 +79,7 @@ function clampText(value, max = 128) {
   return value.trim().slice(0, max);
 }
 
-function parseCsvLine(line) {
+function parseCsvLine(line, delimiter = ',') {
   const out = [];
   let cur = '';
   let inQuotes = false;
@@ -115,7 +92,7 @@ function parseCsvLine(line) {
       } else {
         inQuotes = !inQuotes;
       }
-    } else if (ch === ',' && !inQuotes) {
+    } else if (ch === delimiter && !inQuotes) {
       out.push(cur);
       cur = '';
     } else {
@@ -123,30 +100,29 @@ function parseCsvLine(line) {
     }
   }
   out.push(cur);
-  return out.map((v) => v.trim());
+  return out.map((s) => s.trim());
 }
 
 function parseCsv(text) {
-  const lines = text
+  const lines = String(text || '')
     .replace(/\r/g, '')
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'));
-
   if (lines.length === 0) {
     return { headers: [], rows: [] };
   }
 
-  const headers = parseCsvLine(lines[0]);
+  const delimiter = lines[0].includes(',') ? ',' : (lines[0].includes('\\t') ? '\\t' : ',');
+  const headers = parseCsvLine(lines[0], delimiter);
   const rows = lines.slice(1).map((line) => {
-    const cols = parseCsvLine(line);
+    const cols = parseCsvLine(line, delimiter);
     const row = {};
-    for (let i = 0; i < headers.length; i += 1) {
-      row[headers[i]] = cols[i] || '';
-    }
+    headers.forEach((h, i) => {
+      row[h] = cols[i] || '';
+    });
     return row;
   });
-
   return { headers, rows };
 }
 
@@ -156,179 +132,152 @@ function parseBool(value) {
 }
 
 function parseMode(value) {
-  const v = String(value ?? '').trim().toUpperCase();
-  if (['D', 'T', 'DE', 'TE'].includes(v)) {
-    return v;
+  const m = String(value ?? '').trim().toUpperCase();
+  if (['D', 'T', 'DE', 'TE'].includes(m)) {
+    return m;
   }
   return 'D';
 }
 
-function modeToRule(mode) {
-  return mode.endsWith('E') ? 'deny' : 'allow';
-}
-
-function modeEncrypted(mode, encrypted) {
-  if (typeof encrypted === 'boolean') {
-    return encrypted;
-  }
-  return mode.endsWith('E');
-}
-
-function normalizeTalkgroup(raw, idx, errors) {
-  const tgid = Number(raw.tgid);
-  if (!Number.isInteger(tgid) || tgid < 0 || tgid > 65535) {
-    errors.push(`Row ${idx + 1}: invalid tgid '${raw.tgid}'`);
+function normalizeFreqToken(token) {
+  const v = String(token || '').trim();
+  if (!v) {
     return null;
   }
-
-  const mode = parseMode(raw.mode);
-  const encrypted = modeEncrypted(mode, raw.encrypted);
-  const favorite = Boolean(raw.favorite);
-
-  return {
-    tgid,
-    label: clampText(raw.label || `TG ${tgid}`),
-    mode,
-    encrypted,
-    category: clampText(raw.category || 'uncategorized', 64) || 'uncategorized',
-    favorite,
-    filterAction: modeToRule(mode),
-    enabled: raw.enabled !== false
-  };
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) {
+    return null;
+  }
+  return n.toFixed(5).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-function normalizeTalkgroupsFromRows(rows) {
+function parseFreqList(value) {
+  return String(value || '')
+    .split(/[;|\s]+/)
+    .map((v) => normalizeFreqToken(v))
+    .filter(Boolean);
+}
+
+function normalizeSitesCsv(csvText) {
+  const parsed = parseCsv(csvText);
+  const errors = [];
+  const sites = [];
+
+  const required = ['site_name', 'control_freq'];
+  for (const key of required) {
+    if (!parsed.headers.includes(key)) {
+      errors.push(`Missing required CSV header: ${key}`);
+    }
+  }
+  if (errors.length > 0) {
+    return { errors, sites: [] };
+  }
+
+  parsed.rows.forEach((row, idx) => {
+    const rowNo = idx + 2;
+    const name = clampText(row.site_name, 128);
+    if (!name) {
+      errors.push(`Row ${rowNo}: site_name is required`);
+      return;
+    }
+
+    const controlChannels = parseFreqList(row.control_freq);
+    if (controlChannels.length === 0) {
+      errors.push(`Row ${rowNo}: control_freq is required and must be numeric`);
+      return;
+    }
+
+    const alternateChannels = parseFreqList(row.alt_freqs);
+    sites.push({
+      name,
+      nac: clampText(row.nac, 16) || null,
+      sysid: clampText(row.sysid, 16) || null,
+      wacn: clampText(row.wacn, 16) || null,
+      controlChannels,
+      alternateChannels,
+      bandplan: clampText(row.bandplan, 64) || null
+    });
+  });
+
+  return { errors, sites };
+}
+
+function normalizeTalkgroupsCsv(csvText) {
+  const parsed = parseCsv(csvText);
   const errors = [];
   const dedupe = new Map();
 
-  rows.forEach((row, idx) => {
-    const normalized = normalizeTalkgroup(
-      {
-        tgid: row.tgid,
-        label: row.label,
-        mode: row.mode,
-        encrypted: row.encrypted,
-        category: row.category,
-        favorite: row.favorite,
-        enabled: row.enabled
-      },
-      idx,
-      errors
-    );
-
-    if (normalized) {
-      dedupe.set(normalized.tgid, normalized);
+  const required = ['tgid', 'label'];
+  for (const key of required) {
+    if (!parsed.headers.includes(key)) {
+      errors.push(`Missing required CSV header: ${key}`);
     }
+  }
+  if (errors.length > 0) {
+    return { errors, entries: [] };
+  }
+
+  parsed.rows.forEach((row, idx) => {
+    const rowNo = idx + 2;
+    const tgid = Number(row.tgid);
+    if (!Number.isInteger(tgid) || tgid < 0 || tgid > 65535) {
+      errors.push(`Row ${rowNo}: invalid tgid '${row.tgid}'`);
+      return;
+    }
+    const label = clampText(row.label, 128);
+    if (!label) {
+      errors.push(`Row ${rowNo}: label is required`);
+      return;
+    }
+
+    const mode = parseMode(row.mode);
+    const encrypted = row.encrypted === '' ? mode.endsWith('E') : parseBool(row.encrypted);
+    const category = clampText(row.category, 64) || 'uncategorized';
+    const favorite = parseBool(row.favorite);
+    const enabled = row.enabled === '' ? true : parseBool(row.enabled);
+
+    dedupe.set(tgid, {
+      tgid,
+      label,
+      mode,
+      encrypted,
+      category,
+      favorite,
+      filterAction: encrypted ? 'deny' : 'allow',
+      enabled
+    });
   });
-
-  return { errors, entries: Array.from(dedupe.values()).sort((a, b) => a.tgid - b.tgid) };
-}
-
-function normalizeTalkgroupsPayload(payload = {}) {
-  if (Array.isArray(payload.entries)) {
-    const rows = payload.entries.map((entry) => ({
-      tgid: entry?.tgid,
-      label: entry?.label,
-      mode: entry?.mode,
-      encrypted: entry?.encrypted,
-      category: entry?.category,
-      favorite: entry?.favorite,
-      enabled: entry?.enabled
-    }));
-    return normalizeTalkgroupsFromRows(rows);
-  }
-
-  if (typeof payload.csv === 'string') {
-    const parsed = parseCsv(payload.csv);
-    return normalizeTalkgroupsFromRows(parsed.rows);
-  }
-
-  return { errors: ['No entries or csv payload found'], entries: [] };
-}
-
-function validateSystemSite(site, idx, errors) {
-  const name = clampText(site?.name || `Site ${idx + 1}`, 128);
-  const controlChannels = Array.isArray(site?.controlChannels)
-    ? site.controlChannels.map((f) => String(f).trim()).filter(Boolean)
-    : [];
-  const alternateChannels = Array.isArray(site?.alternateChannels)
-    ? site.alternateChannels.map((f) => String(f).trim()).filter(Boolean)
-    : [];
-
-  if (controlChannels.length === 0) {
-    errors.push(`Site ${idx + 1}: at least one control channel is required`);
-  }
-
-  return {
-    name,
-    nac: clampText(site?.nac, 16) || null,
-    sysid: clampText(site?.sysid, 16) || null,
-    wacn: clampText(site?.wacn, 16) || null,
-    controlChannels,
-    alternateChannels,
-    bandplan: clampText(site?.bandplan, 64) || null
-  };
-}
-
-function normalizeProfileImport(profile, payload) {
-  const errors = [];
-  if (!PROFILE_OPTIONS.has(profile)) {
-    errors.push(`Profile must be one of: ${Array.from(PROFILE_OPTIONS).join(', ')}`);
-  }
-
-  const label = clampText(payload?.label || profile, 128) || profile;
-  const description = clampText(payload?.description || '', 240);
-  const command = Array.isArray(payload?.command) && payload.command.every((x) => typeof x === 'string')
-    ? payload.command
-    : [
-      'python3',
-      '/opt/op25/op25/gr-op25_repeater/apps/rx.py',
-      '--args',
-      'rtl',
-      '-S',
-      '2400000',
-      '-T',
-      `{PROFILES_DIR}/${profile}.tsv`,
-      '-2',
-      '-V',
-      '-O',
-      'plughw:Loopback,0,0',
-      '-U'
-    ];
-
-  let sites = [];
-  if (Array.isArray(payload?.system?.sites)) {
-    sites = payload.system.sites.map((site, idx) => validateSystemSite(site, idx, errors));
-  } else {
-    errors.push('system.sites array is required');
-  }
-
-  const talkgroups = normalizeTalkgroupsPayload(payload?.talkgroups || payload);
-  errors.push(...talkgroups.errors);
 
   return {
     errors,
-    profileDoc: {
-      label,
-      description,
-      notes: clampText(payload?.notes || '', 500),
-      system: {
-        name: clampText(payload?.system?.name || profile, 128) || profile,
-        sysid: clampText(payload?.system?.sysid, 16) || null,
-        wacn: clampText(payload?.system?.wacn, 16) || null,
-        nac: clampText(payload?.system?.nac, 16) || null,
-        bandplan: clampText(payload?.system?.bandplan, 64) || null,
-        sites
-      },
-      command,
-      updatedAt: nowIso(),
-      importSource: payload?.importSource || 'manual'
-    },
-    talkgroupDoc: {
-      updatedAt: nowIso(),
-      entries: talkgroups.entries
-    }
+    entries: Array.from(dedupe.values()).sort((a, b) => a.tgid - b.tgid)
   };
+}
+
+function normalizeTalkgroupsEntries(entries) {
+  const errors = [];
+  const out = [];
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i] || {};
+    const tgid = Number(e.tgid);
+    if (!Number.isInteger(tgid) || tgid < 0 || tgid > 65535) {
+      errors.push(`Row ${i + 1}: invalid tgid '${e.tgid}'`);
+      continue;
+    }
+    const mode = parseMode(e.mode);
+    const encrypted = typeof e.encrypted === 'boolean' ? e.encrypted : mode.endsWith('E');
+    out.push({
+      tgid,
+      label: clampText(e.label || `TG ${tgid}`),
+      mode,
+      encrypted,
+      category: clampText(e.category || 'uncategorized', 64) || 'uncategorized',
+      favorite: !!e.favorite,
+      filterAction: encrypted ? 'deny' : 'allow',
+      enabled: e.enabled !== false
+    });
+  }
+  return { errors, entries: out.sort((a, b) => a.tgid - b.tgid) };
 }
 
 function buildFilterPolicy(entries) {
@@ -344,18 +293,26 @@ function buildFilterPolicy(entries) {
 }
 
 function persistTalkgroups(profile, entries) {
-  const talkgroupDoc = {
+  const doc = {
     updatedAt: nowIso(),
     filter: buildFilterPolicy(entries),
     entries
   };
-  writeJson(talkgroupsFile(profile), talkgroupDoc);
+  writeJson(talkgroupsFile(profile), doc);
   writeJson(filterFile(profile), {
     generatedAt: nowIso(),
     profile,
-    filter: talkgroupDoc.filter
+    filter: doc.filter
   });
-  return talkgroupDoc;
+  return doc;
+}
+
+function triggerReload(reason, profile = activeProfile()) {
+  writeJson(RELOAD_FILE, {
+    requestedAt: nowIso(),
+    reason,
+    profile: profile || null
+  });
 }
 
 function readProfileSummary(name) {
@@ -365,80 +322,135 @@ function readProfileSummary(name) {
     label: p.label || name,
     description: p.description || '',
     hasTalkgroups: fs.existsSync(talkgroupsFile(name)),
-    system: p.system || null,
-    updatedAt: p.updatedAt || null
+    updatedAt: p.updatedAt || null,
+    system: p.system || null
   };
 }
 
-function execCommand(command, args = [], timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { shell: false });
-    let stdout = '';
-    let stderr = '';
-    let done = false;
+function extractClientIp(req) {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  let ip = forwarded || req.ip || req.connection?.remoteAddress || '';
+  if (ip.startsWith('::ffff:')) {
+    ip = ip.slice(7);
+  }
+  return ip;
+}
 
-    const finish = (result) => {
-      if (done) {
-        return;
-      }
-      done = true;
-      resolve(result);
-    };
+function isPrivateIp(ip) {
+  if (!ip) return false;
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  if (ip.startsWith('10.')) return true;
+  if (ip.startsWith('192.168.')) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)) return true;
+  if (ip.startsWith('fc') || ip.startsWith('fd')) return true;
+  return false;
+}
 
-    const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // no-op
-      }
-      finish({ ok: false, code: null, stdout, stderr: `${stderr} (timeout)` });
-    }, timeoutMs);
+function extractAuthToken(req) {
+  const header = String(req.headers['x-admin-token'] || '').trim();
+  if (header) {
+    return header;
+  }
 
-    child.stdout.on('data', (buf) => {
-      stdout += String(buf);
+  const auth = String(req.headers.authorization || '');
+  if (auth.startsWith('Bearer ')) {
+    return auth.slice(7).trim();
+  }
+
+  if (auth.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+      const parts = decoded.split(':');
+      return parts[1] || parts[0] || '';
+    } catch {
+      return '';
+    }
+  }
+
+  return '';
+}
+
+function guardControl(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(503).json({ ok: false, error: 'ADMIN_TOKEN is not configured; control endpoints disabled' });
+  }
+
+  const token = extractAuthToken(req);
+  if (token !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+
+  const ip = extractClientIp(req);
+  if (CONTROL_PRIVATE_ONLY && !isPrivateIp(ip)) {
+    return res.status(403).json({ ok: false, error: `Forbidden from non-private address: ${ip || 'unknown'}` });
+  }
+
+  return next();
+}
+
+async function callHostHelper(method, endpoint, body) {
+  if (!HOST_HELPER_URL) {
+    return { ok: false, status: 503, error: 'Host helper not configured' };
+  }
+
+  const url = `${HOST_HELPER_URL.replace(/\/$/, '')}${endpoint}`;
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-token': HOST_HELPER_TOKEN
+      },
+      body: body ? JSON.stringify(body) : undefined
     });
-    child.stderr.on('data', (buf) => {
-      stderr += String(buf);
-    });
+    const txt = await res.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(txt);
+    } catch {
+      parsed = { ok: false, stdout: '', stderr: txt, exitCode: res.status };
+    }
+    return { ok: res.ok, status: res.status, data: parsed };
+  } catch (err) {
+    return { ok: false, status: 502, error: err.message };
+  }
+}
 
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      finish({ ok: false, code: null, stdout, stderr: err.message });
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      finish({ ok: code === 0, code, stdout: stdout.trim(), stderr: stderr.trim() });
-    });
-  });
+function controlFallback(action, command) {
+  return {
+    ok: false,
+    action,
+    stdout: '',
+    stderr: `Host helper unavailable. Run on host: ${command}`,
+    exitCode: 127,
+    ts: nowIso()
+  };
 }
 
 async function checkIcecast() {
   const checkedAt = nowIso();
   try {
-    const res = await fetch(ICECAST_STATUS_URL, { method: 'GET' });
+    const res = await fetch(ICECAST_STATUS_URL);
     if (!res.ok) {
       return {
         status: 'red',
-        message: `Icecast status endpoint returned ${res.status}`,
+        message: `Icecast endpoint returned ${res.status}`,
         last_checked: checkedAt,
         details: {}
       };
     }
-    const payload = await res.json();
-    const src = payload?.icestats?.source;
+    const data = await res.json();
+    const src = data?.icestats?.source;
     const sources = Array.isArray(src) ? src : src ? [src] : [];
-    const streamSource = sources.find((s) => s.listenurl && String(s.listenurl).includes('/stream')) || null;
-
+    const stream = sources.find((s) => String(s.listenurl || '').includes('/stream')) || null;
     return {
-      status: streamSource ? 'green' : 'yellow',
-      message: streamSource ? 'Icecast reachable; /stream mount visible' : 'Icecast reachable; /stream mount not visible',
+      status: stream ? 'green' : 'yellow',
+      message: stream ? 'Icecast reachable; /stream mount visible' : 'Icecast reachable; /stream mount missing',
       last_checked: checkedAt,
       details: {
-        streamMounted: !!streamSource,
-        listenerCount: streamSource?.listeners ?? 0,
-        sourceConnected: !!streamSource,
-        sourceIp: streamSource?.server_name || null
+        streamMounted: !!stream,
+        sourceConnected: !!stream,
+        listeners: stream?.listeners || 0
       }
     };
   } catch (err) {
@@ -452,338 +464,355 @@ async function checkIcecast() {
 }
 
 function isRecent(isoString, seconds = 15) {
-  if (!isoString) {
-    return false;
-  }
+  if (!isoString) return false;
   const t = Date.parse(isoString);
-  if (!Number.isFinite(t)) {
-    return false;
-  }
+  if (!Number.isFinite(t)) return false;
   return Date.now() - t <= seconds * 1000;
 }
 
 async function buildHealth() {
-  const status = readJson(STATUS_FILE, {});
   const checkedAt = nowIso();
+  const status = readJson(STATUS_FILE, {});
   const icecast = await checkIcecast();
-  const active = activeProfile();
+  const helperHealth = await callHostHelper('GET', '/health');
 
-  const systemd = await execCommand('systemctl', ['is-active', OP25_SYSTEMD_SERVICE], 1500);
-  const hasAloop = await execCommand('sh', ['-c', "grep -q '^snd_aloop ' /proc/modules"], 1000);
-  const loopCard = await execCommand('sh', ['-c', "test -r /proc/asound/cards && grep -qi loopback /proc/asound/cards"], 1000);
-  const rtlSdr = await execCommand('sh', ['-c', 'command -v rtl_sdr >/dev/null 2>&1'], 1000);
+  const helperReady = helperHealth.ok && helperHealth.data?.ok;
+  const op25SupervisorMessage = helperReady
+    ? helperHealth.data?.details?.op25Supervisor || 'helper connected'
+    : 'requires host helper for systemctl checks';
 
-  const op25Locked = Boolean(status.locked);
-  const op25Fresh = isRecent(status.lastUpdated, 15);
+  let alsaStatus = 'yellow';
+  let alsaMessage = 'requires host helper to verify Loopback on host';
+  if (helperReady) {
+    const found = !!helperHealth.data?.details?.alsaLoopback;
+    alsaStatus = found ? 'green' : 'red';
+    alsaMessage = found ? 'Loopback detected in /proc/asound/cards' : 'Loopback missing. Run: sudo modprobe snd-aloop';
+  }
+
+  let sdrStatus = 'yellow';
+  let sdrMessage = 'requires host helper for USB/RTL checks';
+  if (helperReady) {
+    const rtlFound = !!helperHealth.data?.details?.rtlSdrInPath;
+    const usbFound = !!helperHealth.data?.details?.rtlUsbPresent;
+    if (rtlFound && usbFound) {
+      sdrStatus = 'green';
+      sdrMessage = 'RTL utility and USB dongle detected';
+    } else {
+      sdrStatus = 'yellow';
+      sdrMessage = 'Install rtl-sdr, add udev rules, and confirm dongle is connected';
+    }
+  }
+
+  const locked = !!status.locked;
 
   return {
-    activeProfile: active,
+    activeProfile: activeProfile(),
     checks: {
       backend: {
         status: 'green',
         message: 'Backend API reachable',
         last_checked: checkedAt
       },
-      icecast: icecast,
+      hostHelper: {
+        status: helperReady ? 'green' : 'yellow',
+        message: helperReady ? 'Host helper reachable' : (helperHealth.error || helperHealth.data?.error || 'Host helper not configured/reachable'),
+        last_checked: checkedAt
+      },
+      icecast,
       streamer: {
         status: icecast.details?.sourceConnected ? 'green' : 'yellow',
-        message: icecast.details?.sourceConnected ? 'Streamer source connected to /stream' : 'No source connected to /stream',
+        message: icecast.details?.sourceConnected ? 'Streamer source connected' : 'Streamer source not connected to /stream',
         last_checked: checkedAt
       },
       op25Supervisor: {
-        status: systemd.ok ? 'green' : 'yellow',
-        message: systemd.ok ? 'op25-supervisor.service is active' : `systemctl check unavailable/inactive (${systemd.stderr || systemd.stdout || 'unknown'})`,
+        status: helperReady ? (helperHealth.data?.details?.op25SupervisorActive ? 'green' : 'yellow') : 'yellow',
+        message: op25SupervisorMessage,
         last_checked: checkedAt
       },
       op25Process: {
-        status: status.running ? (op25Locked ? 'green' : 'yellow') : 'red',
-        message: status.running
-          ? op25Locked
-            ? 'OP25 running and locked'
-            : 'OP25 running but not locked yet'
-          : 'OP25 process not running',
+        status: status.running ? (locked ? 'green' : 'yellow') : 'red',
+        message: status.running ? (locked ? 'OP25 running and locked' : 'OP25 running but not locked') : 'OP25 not running',
         last_checked: checkedAt,
         details: {
-          locked: op25Locked,
+          locked,
           last_status_update: status.lastUpdated || null,
           last_decode_time: status.lastDecodeTime || null,
-          fresh: op25Fresh
+          fresh: isRecent(status.lastUpdated, 20)
         }
       },
       alsaLoopback: {
-        status: hasAloop.ok && loopCard.ok ? 'green' : hasAloop.ok || loopCard.ok ? 'yellow' : 'red',
-        message: hasAloop.ok && loopCard.ok
-          ? 'snd-aloop loaded and loopback device present'
-          : 'Loopback not fully detected (check snd-aloop and /proc/asound/cards)',
+        status: alsaStatus,
+        message: alsaMessage,
         last_checked: checkedAt
       },
       sdr: {
-        status: rtlSdr.ok ? 'green' : 'yellow',
-        message: rtlSdr.ok ? 'rtl_sdr binary found' : 'rtl_sdr not found in PATH (warning)',
+        status: sdrStatus,
+        message: sdrMessage,
         last_checked: checkedAt
       }
     }
   };
 }
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '6mb' }));
 app.use(express.static('/app/public'));
 
 app.get('/api/profiles', (_req, res) => {
-  const current = activeProfile();
   const profiles = listProfiles().map(readProfileSummary);
-  res.json({ profiles, activeProfile: current });
+  res.json({ profiles, activeProfile: activeProfile() });
 });
 
 app.post('/api/profiles/switch', (req, res) => {
-  const { profile } = req.body || {};
+  const profile = req.body?.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
   }
-
-  const pf = profileFile(profile);
-  if (!fs.existsSync(pf)) {
+  if (!fs.existsSync(profileFile(profile))) {
     return res.status(404).json({ error: `Profile '${profile}' not found` });
   }
 
   const changedAt = nowIso();
-  writeJson(ACTIVE_PROFILE_FILE, {
-    profile,
-    changedAt,
-    changedBy: 'api'
-  });
-
-  triggerOp25Reload('profile-switch', profile);
+  writeJson(ACTIVE_PROFILE_FILE, { profile, changedAt, changedBy: 'api' });
+  triggerReload('profile-switch', profile);
   return res.json({ ok: true, profile, changedAt });
 });
 
 app.get('/api/talkgroups/:profile', (req, res) => {
-  const { profile } = req.params;
+  const profile = req.params.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
   }
-
   const payload = readJson(talkgroupsFile(profile), { entries: [], filter: { policy: 'blacklist', allow: [], deny: [] } });
   return res.json(payload);
 });
 
 app.put('/api/talkgroups/:profile', (req, res) => {
-  const { profile } = req.params;
+  const profile = req.params.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
   }
-
-  const normalized = normalizeTalkgroupsPayload({ entries: req.body?.entries || [] });
+  const normalized = normalizeTalkgroupsEntries(Array.isArray(req.body?.entries) ? req.body.entries : []);
   if (normalized.errors.length > 0) {
-    return res.status(400).json({ error: normalized.errors.join('; ') });
+    return res.status(400).json({ error: normalized.errors.join('; '), errors: normalized.errors });
   }
-
   const saved = persistTalkgroups(profile, normalized.entries);
-  triggerOp25Reload('talkgroup-update', profile);
+  triggerReload('talkgroup-update', profile);
   return res.json({ ok: true, count: saved.entries.length, filter: saved.filter });
 });
 
-app.post('/api/talkgroups/import/:profile/preview', (req, res) => {
-  const { profile } = req.params;
+app.post('/api/import/sites/:profile/preview', (req, res) => {
+  const profile = req.params.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
   }
-
-  const normalized = normalizeTalkgroupsPayload(req.body || {});
-  return res.json({ ok: normalized.errors.length === 0, errors: normalized.errors, entries: normalized.entries.slice(0, 200), total: normalized.entries.length });
+  const csv = req.body?.csv;
+  const parsed = normalizeSitesCsv(csv);
+  return res.json({ ok: parsed.errors.length === 0, errors: parsed.errors, preview: parsed.sites, total: parsed.sites.length });
 });
 
-app.post('/api/talkgroups/import/:profile/save', (req, res) => {
-  const { profile } = req.params;
+app.post('/api/import/sites/:profile/save', (req, res) => {
+  const profile = req.params.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
   }
 
-  const normalized = normalizeTalkgroupsPayload(req.body || {});
+  const csv = req.body?.csv;
+  const parsed = normalizeSitesCsv(csv);
+  if (parsed.errors.length > 0) {
+    return res.status(400).json({ error: parsed.errors.join('; '), errors: parsed.errors });
+  }
+
+  const existing = readJson(profileFile(profile), {});
+  const updated = {
+    label: existing.label || profile,
+    description: existing.description || `${profile} imported profile`,
+    notes: existing.notes || 'Imported from user-supplied CSV',
+    system: {
+      name: existing.system?.name || profile,
+      sysid: existing.system?.sysid || null,
+      wacn: existing.system?.wacn || null,
+      nac: existing.system?.nac || null,
+      bandplan: existing.system?.bandplan || 'P25 Auto',
+      sites: parsed.sites
+    },
+    command: Array.isArray(existing.command) && existing.command.length > 0
+      ? existing.command
+      : [
+        'python3',
+        '/opt/op25/op25/gr-op25_repeater/apps/rx.py',
+        '--args',
+        'rtl',
+        '-S',
+        '2400000',
+        '-T',
+        `{PROFILES_DIR}/${profile}.tsv`,
+        '-2',
+        '-V',
+        '-O',
+        'plughw:Loopback,0,0',
+        '-U'
+      ],
+    updatedAt: nowIso(),
+    importSource: 'sites-csv'
+  };
+
+  writeJson(profileFile(profile), updated);
+  triggerReload('sites-import', profile);
+  return res.json({ ok: true, profile, sites: parsed.sites.length });
+});
+
+app.post('/api/import/talkgroups/:profile/preview', (req, res) => {
+  const profile = req.params.profile;
+  if (!isSafeProfileName(profile)) {
+    return res.status(400).json({ error: 'Invalid profile name' });
+  }
+  const csv = req.body?.csv;
+  const parsed = normalizeTalkgroupsCsv(csv);
+  return res.json({ ok: parsed.errors.length === 0, errors: parsed.errors, preview: parsed.entries.slice(0, 250), total: parsed.entries.length });
+});
+
+app.post('/api/import/talkgroups/:profile/save', (req, res) => {
+  const profile = req.params.profile;
+  if (!isSafeProfileName(profile)) {
+    return res.status(400).json({ error: 'Invalid profile name' });
+  }
+  const csv = req.body?.csv;
+  const parsed = normalizeTalkgroupsCsv(csv);
+  if (parsed.errors.length > 0) {
+    return res.status(400).json({ error: parsed.errors.join('; '), errors: parsed.errors });
+  }
+  const saved = persistTalkgroups(profile, parsed.entries);
+  triggerReload('talkgroup-import', profile);
+  return res.json({ ok: true, profile, talkgroups: saved.entries.length, filter: saved.filter });
+});
+
+app.post('/api/import/profile/:profile/from-json-file', (req, res) => {
+  const profile = req.params.profile;
+  if (!isSafeProfileName(profile)) {
+    return res.status(400).json({ error: 'Invalid profile name' });
+  }
+  const fileName = req.body?.fileName || `${profile}.import.json`;
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(fileName)) {
+    return res.status(400).json({ error: 'Invalid fileName' });
+  }
+  const fullPath = path.join(PROFILES_DIR, fileName);
+  if (!fs.existsSync(fullPath)) {
+    return res.status(404).json({ error: `Not found: ${fileName}` });
+  }
+
+  const raw = readJson(fullPath, null);
+  if (!raw) {
+    return res.status(400).json({ error: `Invalid JSON: ${fileName}` });
+  }
+
+  if (!Array.isArray(raw.system?.sites) || !Array.isArray(raw.talkgroups?.entries)) {
+    return res.status(400).json({ error: 'JSON file must include system.sites[] and talkgroups.entries[]' });
+  }
+
+  writeJson(profileFile(profile), {
+    label: raw.label || profile,
+    description: raw.description || `${profile} imported profile`,
+    notes: raw.notes || 'Imported from user JSON',
+    system: raw.system,
+    command: Array.isArray(raw.command) && raw.command.length > 0 ? raw.command : [
+      'python3', '/opt/op25/op25/gr-op25_repeater/apps/rx.py', '--args', 'rtl', '-S', '2400000', '-T', `{PROFILES_DIR}/${profile}.tsv`, '-2', '-V', '-O', 'plughw:Loopback,0,0', '-U'
+    ],
+    updatedAt: nowIso(),
+    importSource: `json-file:${fileName}`
+  });
+
+  const normalized = normalizeTalkgroupsEntries(raw.talkgroups.entries);
   if (normalized.errors.length > 0) {
     return res.status(400).json({ error: normalized.errors.join('; '), errors: normalized.errors });
   }
 
   const saved = persistTalkgroups(profile, normalized.entries);
-  triggerOp25Reload('talkgroup-import', profile);
-  return res.json({ ok: true, count: saved.entries.length, filter: saved.filter });
-});
-
-app.post('/api/import/profile/:profile/preview', (req, res) => {
-  const { profile } = req.params;
-  const payload = req.body || {};
-
-  let transformed = payload;
-  if (typeof payload.csv === 'string') {
-    const parsed = parseCsv(payload.csv);
-    transformed = {
-      importSource: 'csv',
-      label: payload.label || profile,
-      description: payload.description || '',
-      system: {
-        name: payload.systemName || profile,
-        sysid: payload.sysid || '',
-        wacn: payload.wacn || '',
-        nac: payload.nac || '',
-        bandplan: payload.bandplan || '',
-        sites: [
-          {
-            name: payload.siteName || 'Default Site',
-            controlChannels: String(payload.controlChannels || '').split(/[;\s]+/).filter(Boolean),
-            alternateChannels: String(payload.alternateChannels || '').split(/[;\s]+/).filter(Boolean),
-            nac: payload.siteNac || payload.nac || ''
-          }
-        ]
-      },
-      talkgroups: {
-        csv: payload.csv
-      }
-    };
-  }
-
-  const result = normalizeProfileImport(profile, transformed);
-  return res.json({
-    ok: result.errors.length === 0,
-    errors: result.errors,
-    preview: {
-      profile: result.profileDoc,
-      talkgroups: result.talkgroupDoc.entries.slice(0, 200),
-      totalTalkgroups: result.talkgroupDoc.entries.length
-    }
-  });
-});
-
-app.post('/api/import/profile/:profile/save', (req, res) => {
-  const { profile } = req.params;
-  const payload = req.body || {};
-
-  let transformed = payload;
-  if (typeof payload.csv === 'string') {
-    const parsed = parseCsv(payload.csv);
-    transformed = {
-      importSource: 'csv',
-      label: payload.label || profile,
-      description: payload.description || '',
-      system: {
-        name: payload.systemName || profile,
-        sysid: payload.sysid || '',
-        wacn: payload.wacn || '',
-        nac: payload.nac || '',
-        bandplan: payload.bandplan || '',
-        sites: [
-          {
-            name: payload.siteName || 'Default Site',
-            controlChannels: String(payload.controlChannels || '').split(/[;\s]+/).filter(Boolean),
-            alternateChannels: String(payload.alternateChannels || '').split(/[;\s]+/).filter(Boolean),
-            nac: payload.siteNac || payload.nac || ''
-          }
-        ]
-      },
-      talkgroups: {
-        csv: payload.csv
-      }
-    };
-    if (parsed.rows.length === 0) {
-      return res.status(400).json({ error: 'CSV payload had no rows' });
-    }
-  }
-
-  const result = normalizeProfileImport(profile, transformed);
-  if (result.errors.length > 0) {
-    return res.status(400).json({ error: result.errors.join('; '), errors: result.errors });
-  }
-
-  writeJson(profileFile(profile), result.profileDoc);
-  const talkgroupDoc = persistTalkgroups(profile, result.talkgroupDoc.entries);
-
-  const tsvPath = path.join(PROFILES_DIR, `${profile}.tsv`);
-  if (!fs.existsSync(tsvPath)) {
-    fs.writeFileSync(tsvPath, '# generated placeholder - update with full OP25 trunk config\n', 'utf8');
-  }
-
-  triggerOp25Reload('profile-import', profile);
-  return res.json({ ok: true, profile, talkgroups: talkgroupDoc.entries.length, filter: talkgroupDoc.filter });
-});
-
-app.post('/api/import/profile/:profile/from-json-file', (req, res) => {
-  const { profile } = req.params;
-  if (!isSafeProfileName(profile)) {
-    return res.status(400).json({ error: 'Invalid profile name' });
-  }
-
-  const fileName = req.body?.fileName || `${profile}.import.json`;
-  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(fileName)) {
-    return res.status(400).json({ error: 'Invalid file name' });
-  }
-
-  const filePath = path.join(PROFILES_DIR, fileName);
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: `Import file not found: ${fileName}` });
-  }
-
-  const raw = readJson(filePath, null);
-  if (!raw) {
-    return res.status(400).json({ error: `Unable to parse JSON from ${fileName}` });
-  }
-
-  const result = normalizeProfileImport(profile, { ...raw, importSource: `json-file:${fileName}` });
-  if (result.errors.length > 0) {
-    return res.status(400).json({ error: result.errors.join('; '), errors: result.errors });
-  }
-
-  writeJson(profileFile(profile), result.profileDoc);
-  const talkgroupDoc = persistTalkgroups(profile, result.talkgroupDoc.entries);
-  triggerOp25Reload('profile-json-import', profile);
-
-  return res.json({ ok: true, profile, fileName, talkgroups: talkgroupDoc.entries.length, filter: talkgroupDoc.filter });
+  triggerReload('profile-json-import', profile);
+  return res.json({ ok: true, profile, fileName, talkgroups: saved.entries.length, filter: saved.filter });
 });
 
 app.get('/api/import/templates', (_req, res) => {
   res.json({
-    csvHeaders: ['tgid', 'label', 'mode', 'encrypted', 'category', 'favorite', 'enabled'],
-    csvExample: [
+    sitesCsvHeaders: ['site_name', 'control_freq', 'alt_freqs', 'nac', 'sysid', 'wacn', 'bandplan'],
+    sitesCsvTemplate: [
+      'site_name,control_freq,alt_freqs,nac,sysid,wacn,bandplan',
+      'Phoenix Simulcast,771.10625,771.35625;770.85625,293,123,BEE00,P25 Auto'
+    ].join('\n'),
+    talkgroupsCsvHeaders: ['tgid', 'label', 'mode', 'encrypted', 'category', 'favorite', 'enabled'],
+    talkgroupsCsvTemplate: [
       'tgid,label,mode,encrypted,category,favorite,enabled',
       '1201,Dispatch A,D,false,dispatch,true,true',
       '1202,TAC 2,T,false,tac,false,true',
       '1299,Encrypted Ops,DE,true,ops,false,true'
-    ].join('\n'),
-    jsonExample: {
-      label: 'AZDPS',
-      description: 'User supplied import',
-      system: {
-        name: 'Arizona DPS',
-        sysid: '123',
-        wacn: 'BEE00',
-        nac: '293',
-        bandplan: 'P25 Auto',
-        sites: [
-          {
-            name: 'Phoenix Simulcast',
-            controlChannels: ['771.10625', '771.35625'],
-            alternateChannels: ['770.85625'],
-            nac: '293'
-          }
-        ]
-      },
-      talkgroups: {
-        entries: [
-          { tgid: 1201, label: 'Dispatch A', mode: 'D', encrypted: false, category: 'dispatch', favorite: true, enabled: true }
-        ]
-      }
-    }
+    ].join('\n')
   });
 });
 
+app.get('/api/control/capabilities', guardControl, async (_req, res) => {
+  const helper = await callHostHelper('GET', '/health');
+  res.json({
+    ok: true,
+    helperConfigured: Boolean(HOST_HELPER_URL),
+    helperReachable: helper.ok,
+    helperError: helper.error || helper.data?.error || null
+  });
+});
+
+app.post('/api/control/action', guardControl, async (req, res) => {
+  const action = String(req.body?.action || '').trim();
+  const fallbackCmd = {
+    'start-op25': 'sudo systemctl start op25-supervisor.service',
+    'restart-op25': 'sudo systemctl restart op25-supervisor.service',
+    'stop-op25': 'sudo systemctl stop op25-supervisor.service',
+    'load-alsa-loopback': 'sudo modprobe snd-aloop && grep -i Loopback /proc/asound/cards',
+    'usb-sdr-check': 'lsusb | grep -Ei "rtl|realtek"; command -v rtl_sdr',
+    'restart-streamer': 'docker restart rf-console-streamer',
+    'restart-icecast': 'docker restart rf-console-icecast',
+    'restart-backend': 'docker compose restart backend'
+  };
+
+  if (!fallbackCmd[action]) {
+    return res.status(400).json({ ok: false, error: `Unsupported action: ${action}` });
+  }
+
+  const helper = await callHostHelper('POST', `/action/${encodeURIComponent(action)}`);
+  if (helper.ok) {
+    return res.json(helper.data);
+  }
+
+  return res.status(503).json(controlFallback(action, fallbackCmd[action]));
+});
+
+app.get('/api/control/logs/:target', guardControl, async (req, res) => {
+  const target = String(req.params.target || '').trim();
+  const lines = Math.max(10, Math.min(1000, Number(req.query.lines || 200)));
+  const fallbackCmd = {
+    op25: 'journalctl -u op25-supervisor.service -n 200 --no-pager',
+    streamer: 'docker logs --tail=200 rf-console-streamer',
+    icecast: 'docker logs --tail=200 rf-console-icecast'
+  };
+
+  if (!fallbackCmd[target]) {
+    return res.status(400).json({ ok: false, error: `Unsupported log target: ${target}` });
+  }
+
+  const helper = await callHostHelper('GET', `/logs/${encodeURIComponent(target)}?lines=${lines}`);
+  if (helper.ok) {
+    return res.json(helper.data);
+  }
+
+  return res.status(503).json(controlFallback(`logs-${target}`, fallbackCmd[target]));
+});
+
 app.get('/api/health', async (_req, res) => {
-  const health = await buildHealth();
-  res.json(health);
+  const data = await buildHealth();
+  res.json(data);
 });
 
 app.get('/api/status', (_req, res) => {
   const status = readJson(STATUS_FILE, {});
-  const profile = activeProfile();
-  return res.json({
-    activeProfile: profile,
+  res.json({
+    activeProfile: activeProfile(),
     streamUrl: STREAM_URL,
     status: {
       running: !!status.running,

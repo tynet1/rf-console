@@ -1,49 +1,43 @@
-# Meatboy4500 RF Console
+# Meatboy4500 RF Console (rf-console)
 
-iPad-friendly local web GUI for OP25 profile switching, status/health visibility, legal user-driven data import, talkgroup filtering, and Icecast audio playback.
+Mobile-first LAN UI for OP25 profile/status monitoring, talkgroup management, CSV imports, and service troubleshooting.
 
-## What this stack includes
+## Security model for controls
 
-- `docker-compose.yml`
-  - `backend`: Node/Express REST API + mobile web UI
-  - `icecast`: audio stream endpoint
-  - `streamer`: ffmpeg service that reads ALSA loopback and pushes MP3 to Icecast `/stream`
-- Host-side OP25 supervisor (`systemd`)
-  - Watches active profile changes and reload requests
-  - Restarts OP25 on profile switch or talkgroup/filter changes
-  - Publishes decode/status metadata for the UI/API
+Control endpoints are protected by `ADMIN_TOKEN`.
+
+- Backend control routes require `X-Admin-Token` (or basic/bearer token).
+- Optional private network restriction is enabled by default (`CONTROL_PRIVATE_ONLY=1`).
+- If backend cannot run privileged commands directly (normal in container), it can proxy to a host helper daemon.
 
 ## Important legal note
 
-Do not scrape or redistribute proprietary/copyrighted frequency or talkgroup datasets in ways that violate terms of service.
+Do not scrape or redistribute proprietary/copyrighted radio datasets in violation of terms.
 
-This project intentionally supports **user-supplied imports**:
-- CSV pasted/uploaded in UI
+This project supports only user-supplied imports:
+- CSV/TSV pasted/uploaded in UI
 - JSON dropped into `/opt/stacks/rf-console/data/profiles`
 
-No direct scraping workflow is provided.
+No direct RadioReference scraping is implemented.
 
-## Paths
+## Stack contents
 
-- Compose stack: `/opt/stacks/rf-console/docker-compose.yml`
-- Backend: `/opt/stacks/rf-console/backend`
-- OP25 service unit: `/opt/stacks/rf-console/op25/host/op25-supervisor.service`
-- Profiles: `/opt/stacks/rf-console/data/profiles`
-- Runtime state: `/opt/stacks/rf-console/data/runtime`
+- `docker-compose.yml`
+  - `backend`: API + web UI
+  - `icecast`: stream server
+  - `streamer`: ffmpeg from ALSA loopback to Icecast
+- Host services
+  - `op25-supervisor.service`
+  - optional `rf-control-helper.service` for privileged actions/logs
 
-## Quick install (Debian 13)
+## Environment variables (backend)
 
-1. Copy folder to `/opt/stacks/rf-console`
-2. Ensure Docker + Compose are installed
-3. Ensure Python 3 exists on host
-4. Install OP25 on host and verify `rx.py` path in profile command arrays
-5. Load ALSA loopback:
+Set in compose:
 
-```bash
-sudo modprobe snd-aloop
-echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
-aplay -l | grep -i loopback
-```
+- `ADMIN_TOKEN` required for Controls API
+- `CONTROL_PRIVATE_ONLY` default `1`
+- `HOST_HELPER_URL` optional (example `http://HOST_IP:9911`)
+- `HOST_HELPER_TOKEN` optional (defaults to `ADMIN_TOKEN`)
 
 ## Start stack
 
@@ -52,37 +46,116 @@ cd /opt/stacks/rf-console
 docker compose up -d --build
 ```
 
-- UI: `http://<LAN-IP>:8080`
-- Icecast: `http://<LAN-IP>:8000`
+UI: `http://<LAN-IP>:8080`
 
-## Install OP25 supervisor service
+## OP25 supervisor install
 
 ```bash
-cd /opt/stacks/rf-console
-sudo cp op25/host/op25-supervisor.service /etc/systemd/system/
+sudo cp /opt/stacks/rf-console/op25/host/op25-supervisor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now op25-supervisor.service
-sudo systemctl status op25-supervisor.service
 ```
 
-Logs:
+## Optional host helper (for Controls tab actions)
+
+Use this if you want Start/Stop/Restart OP25, `modprobe`, `lsusb`, and host logs from UI.
+
+1. Configure token/env:
 
 ```bash
-sudo journalctl -u op25-supervisor.service -f
+cp /opt/stacks/rf-console/op25/host/rf-control-helper.env.example /opt/stacks/rf-console/op25/host/rf-control-helper.env
+# edit ADMIN_TOKEN and optional bind/port/private flag
 ```
 
-## Profile Builder (UI)
+2. Install service:
 
-Use the **Profile Builder** tab to import AZDPS/MCSO data.
+```bash
+sudo cp /opt/stacks/rf-console/op25/host/rf-control-helper.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rf-control-helper.service
+sudo systemctl status rf-control-helper.service
+```
 
-### Supported import methods
+3. Point backend to helper in compose env:
 
-1. Paste CSV into the textarea
-2. Upload `.csv` file
-3. Upload `.json` file (converted to preview)
-4. Drop JSON file into `/opt/stacks/rf-console/data/profiles/<PROFILE>.import.json` then click `Import from /data/profiles JSON`
+```yaml
+ADMIN_TOKEN=your-token
+HOST_HELPER_URL=http://<host-ip-or-helper-bind>:9911
+HOST_HELPER_TOKEN=your-token
+```
 
-### CSV template (talkgroups)
+Notes:
+- If helper binds to `127.0.0.1`, backend container cannot reach it directly.
+- For container access, bind helper to reachable host IP and keep token/private-network protections enabled.
+
+## UI layout
+
+Tabs:
+- `Health` (read-only): status lights + timestamps + OP25 decode fields
+- `Controls`: profile switching, troubleshooting actions, logs panel
+- `Talkgroups`: search/filter/pagination/favorites/bulk enable-disable
+- `Imports`: separate CSV imports for sites and talkgroups
+- `Audio`: embedded stream player
+
+## Control actions (Controls tab)
+
+Action buttons call `/api/control/action`:
+- Start OP25
+- Restart OP25
+- Stop OP25
+- Load ALSA loopback
+- USB/SDR check
+- Restart Streamer
+- Restart Icecast
+- Restart Backend (safe message; backend self-restart is not executed directly)
+
+Log buttons call `/api/control/logs/:target`:
+- OP25 supervisor journal
+- streamer logs
+- icecast logs
+
+Response shape:
+
+```json
+{ "ok": true, "action": "restart-op25", "stdout": "...", "stderr": "", "exitCode": 0, "ts": "2026-02-12T00:00:00Z" }
+```
+
+## CSV import UX
+
+Imports are split by type.
+
+### A) Sites/Control Channels import
+Endpoint:
+- `POST /api/import/sites/:profile/preview`
+- `POST /api/import/sites/:profile/save`
+
+Required fields:
+- `site_name`
+- `control_freq`
+
+Optional:
+- `alt_freqs`, `nac`, `sysid`, `wacn`, `bandplan`
+
+Template:
+
+```csv
+site_name,control_freq,alt_freqs,nac,sysid,wacn,bandplan
+Phoenix Simulcast,771.10625,771.35625;770.85625,293,123,BEE00,P25 Auto
+```
+
+### B) Talkgroups import
+Endpoint:
+- `POST /api/import/talkgroups/:profile/preview`
+- `POST /api/import/talkgroups/:profile/save`
+
+Required fields:
+- `tgid`
+- `label`
+
+Optional:
+- `mode`, `encrypted`, `category`, `favorite`, `enabled`
+
+Template:
 
 ```csv
 tgid,label,mode,encrypted,category,favorite,enabled
@@ -91,112 +164,50 @@ tgid,label,mode,encrypted,category,favorite,enabled
 1299,Encrypted Ops,DE,true,ops,false,true
 ```
 
-`mode` values:
-- `D` clear digital
-- `T` clear trunked
-- `DE` digital encrypted
-- `TE` trunked encrypted
+### JSON import from disk
 
-### JSON template (profile + talkgroups)
+- Place file in `/opt/stacks/rf-console/data/profiles/<PROFILE>.import.json`
+- Use Controls/Imports button or API:
+  - `POST /api/import/profile/:profile/from-json-file`
 
-```json
-{
-  "label": "AZDPS",
-  "description": "User supplied import",
-  "system": {
-    "name": "Arizona DPS",
-    "sysid": "123",
-    "wacn": "BEE00",
-    "nac": "293",
-    "bandplan": "P25 Auto",
-    "sites": [
-      {
-        "name": "Phoenix Simulcast",
-        "controlChannels": ["771.10625", "771.35625"],
-        "alternateChannels": ["770.85625"],
-        "nac": "293"
-      }
-    ]
-  },
-  "talkgroups": {
-    "entries": [
-      {
-        "tgid": 1201,
-        "label": "Dispatch A",
-        "mode": "D",
-        "encrypted": false,
-        "category": "dispatch",
-        "favorite": true,
-        "enabled": true
-      }
-    ]
-  }
-}
-```
+Expected JSON keys include `system.sites[]` and `talkgroups.entries[]`.
 
-## Talkgroup UX
+## Talkgroup filtering behavior
 
-- Search by TGID or label
-- Category filter
-- Favorites-only toggle
-- Show encrypted toggle (default off)
-- Pagination (40 rows/page)
-- Bulk enable/disable by category
+On talkgroup save/import:
+- if any enabled `allow` entries exist: whitelist mode
+- otherwise: blacklist mode (enabled deny list)
 
-## Filtering behavior
-
-On save/import, backend computes filter policy:
-- If enabled `allow` entries exist => `whitelist` mode (only those TGs pass)
-- If no enabled allow entries => `blacklist` mode (enabled deny list blocked)
-
-Filter state is written to:
+Stored in:
 - `/opt/stacks/rf-console/data/profiles/<PROFILE>.talkgroups.json`
 - `/opt/stacks/rf-console/data/runtime/<PROFILE>.filter.json`
 
-Any talkgroup/profile import/save triggers safe OP25 reload via runtime reload request.
+Changes trigger OP25 reload request via `/opt/stacks/rf-console/data/runtime/reload-request.json`.
 
-## REST API
+## Health checks
 
-Base URL: `http://<LAN-IP>:8080`
+`GET /api/health` reports:
+- backend
+- host helper connectivity
+- icecast `/stream`
+- streamer source status
+- op25 supervisor availability
+- op25 lock/decode freshness
+- ALSA loopback presence
+- SDR presence/instructions
 
-- `GET /api/status`
-- `GET /api/health`
-- `GET /api/profiles`
-- `POST /api/profiles/switch`
-- `GET /api/talkgroups/:profile`
-- `PUT /api/talkgroups/:profile`
-- `POST /api/talkgroups/import/:profile/preview`
-- `POST /api/talkgroups/import/:profile/save`
-- `POST /api/import/profile/:profile/preview`
-- `POST /api/import/profile/:profile/save`
-- `POST /api/import/profile/:profile/from-json-file`
-- `GET /api/import/templates`
-
-## System health indicators
-
-UI polls `/api/health` every ~4s for:
-- backend API
-- Icecast reachability + mount status
-- streamer source connected
-- OP25 supervisor (`systemctl` best-effort)
-- OP25 process + lock + decode recency
-- ALSA loopback detection
-- SDR utility presence (`rtl_sdr` warning if missing)
-
-## Encrypted traffic
-
-- No decryption is attempted.
-- Metadata can still appear for encrypted talkgroups while audio remains unavailable.
+If helper is unavailable, health explicitly says host checks require helper.
 
 ## Troubleshooting
 
-- No audio:
-  - Verify `snd-aloop` loaded
-  - Verify OP25 command uses `-O plughw:Loopback,0,0`
-  - Check streamer logs: `docker compose logs -f streamer`
-- No status updates:
-  - Check `journalctl -u op25-supervisor.service -f`
-  - Check `/opt/stacks/rf-console/data/runtime/op25-status.json`
-- Profile switch does not take effect:
-  - Verify `op25-supervisor.service` is active
-  - Verify runtime files are writable
+- No control actions work:
+  - verify `ADMIN_TOKEN` in backend env
+  - verify token entered in Controls tab
+  - verify helper reachable when using privileged actions
+- ALSA loopback missing:
+  - `sudo modprobe snd-aloop`
+  - `grep -i Loopback /proc/asound/cards`
+- SDR missing:
+  - install `rtl-sdr` package
+  - add udev permissions for rtl device
+  - reconnect dongle and run `lsusb`

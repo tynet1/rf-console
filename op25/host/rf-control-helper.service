@@ -1,0 +1,17 @@
+[Unit]
+Description=RF Console Host Control Helper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/stacks/rf-console
+EnvironmentFile=-/opt/stacks/rf-console/op25/host/rf-control-helper.env
+ExecStart=/bin/sh -c 'exec /usr/bin/python3 /opt/stacks/rf-console/op25/host/rf_control_helper.py --bind "${HELPER_BIND:-127.0.0.1}" --port "${HELPER_PORT:-9911}" --token "${ADMIN_TOKEN}" --op25-service "${OP25_SERVICE:-op25-supervisor.service}" ${PRIVATE_ONLY_FLAG:-}'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

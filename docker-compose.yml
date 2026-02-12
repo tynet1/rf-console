@@ -10,7 +10,11 @@ services:
       - PORT=8080
       - DATA_DIR=/data
       - STREAM_URL=http://localhost:8000/stream
-      - SWITCH_HOOK=/app/scripts/switch-profile.sh
+      - ICECAST_STATUS_URL=http://icecast:8000/status-json.xsl
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - CONTROL_PRIVATE_ONLY=${CONTROL_PRIVATE_ONLY:-1}
+      - HOST_HELPER_URL=${HOST_HELPER_URL:-}
+      - HOST_HELPER_TOKEN=${HOST_HELPER_TOKEN:-}
     volumes:
       - ./data:/data
 

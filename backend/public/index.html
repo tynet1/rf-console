@@ -8,56 +8,89 @@
   </head>
   <body>
     <main class="app">
-      <header class="header card">
+      <header class="card">
         <h1>Meatboy4500 RF Console</h1>
-        <div class="row">
-          <select id="profileSelect"></select>
-          <button id="switchBtn">Switch Profile</button>
-          <span id="profileMsg" class="muted"></span>
-        </div>
+        <p class="muted">Mobile-first LAN console for OP25, Icecast, and talkgroup control.</p>
       </header>
 
       <section class="card">
-        <h2>System Health</h2>
-        <div id="healthGrid" class="healthGrid"></div>
-      </section>
-
-      <section class="card">
-        <h2>Live Status</h2>
-        <div class="grid" id="statusGrid">
-          <div><span>Control Freq</span><strong id="controlFreq">-</strong></div>
-          <div><span>RSSI</span><strong id="rssi">-</strong></div>
-          <div><span>SYSID</span><strong id="sysid">-</strong></div>
-          <div><span>WACN</span><strong id="wacn">-</strong></div>
-          <div><span>NAC</span><strong id="nac">-</strong></div>
-          <div><span>Current TG</span><strong id="currentTg">-</strong></div>
-          <div><span>Last TG</span><strong id="lastTg">-</strong></div>
-          <div><span>Locked</span><strong id="locked">-</strong></div>
-          <div><span>Last Decode</span><strong id="lastDecode">-</strong></div>
-          <div><span>Updated</span><strong id="updated">-</strong></div>
-        </div>
-      </section>
-
-      <section class="card tabsWrap">
         <div class="tabs" role="tablist">
-          <button class="tab active" data-tab="talkgroups">Talkgroups</button>
-          <button class="tab" data-tab="builder">Profile Builder</button>
+          <button class="tab active" data-tab="health">Health</button>
+          <button class="tab" data-tab="controls">Controls</button>
+          <button class="tab" data-tab="talkgroups">Talkgroups</button>
+          <button class="tab" data-tab="imports">Imports</button>
           <button class="tab" data-tab="audio">Audio</button>
         </div>
 
-        <div class="tabPanel active" id="tab-talkgroups">
-          <div class="toolbar">
+        <div class="tabPanel active" id="tab-health">
+          <h2>System Health</h2>
+          <div id="healthGrid" class="healthGrid"></div>
+          <h2>Live Status</h2>
+          <div class="grid">
+            <div><span>Active Profile</span><strong id="activeProfile">-</strong></div>
+            <div><span>Control Freq</span><strong id="controlFreq">-</strong></div>
+            <div><span>RSSI</span><strong id="rssi">-</strong></div>
+            <div><span>SYSID</span><strong id="sysid">-</strong></div>
+            <div><span>WACN</span><strong id="wacn">-</strong></div>
+            <div><span>NAC</span><strong id="nac">-</strong></div>
+            <div><span>Current TG</span><strong id="currentTg">-</strong></div>
+            <div><span>Last TG</span><strong id="lastTg">-</strong></div>
+            <div><span>Locked</span><strong id="locked">-</strong></div>
+            <div><span>Last Decode</span><strong id="lastDecode">-</strong></div>
+            <div><span>Last Update</span><strong id="updated">-</strong></div>
+          </div>
+        </div>
+
+        <div class="tabPanel" id="tab-controls">
+          <h2>System Controls</h2>
+          <div class="toolbar wrap">
+            <label>Admin Token <input id="adminToken" type="password" placeholder="required for control actions" /></label>
+            <button id="saveTokenBtn">Save Token</button>
+            <button id="checkControlBtn">Check Control Access</button>
+          </div>
+          <div class="toolbar wrap">
+            <label>Profile
+              <select id="profileSelect"></select>
+            </label>
+            <button id="switchBtn">Switch Profile</button>
+          </div>
+          <p id="controlMsg" class="muted"></p>
+
+          <div class="controlsGrid">
+            <button data-action="start-op25" class="actionBtn">Start OP25</button>
+            <button data-action="restart-op25" class="actionBtn">Restart OP25</button>
+            <button data-action="stop-op25" class="actionBtn">Stop OP25</button>
+            <button data-action="load-alsa-loopback" class="actionBtn">Load ALSA loopback</button>
+            <button data-action="usb-sdr-check" class="actionBtn">USB/SDR Check</button>
+            <button data-action="restart-streamer" class="actionBtn">Restart Streamer</button>
+            <button data-action="restart-icecast" class="actionBtn">Restart Icecast</button>
+            <button data-action="restart-backend" class="actionBtn">Restart Backend</button>
+          </div>
+
+          <div class="toolbar wrap">
+            <button data-log="op25" class="logBtn">Show OP25 Logs</button>
+            <button data-log="streamer" class="logBtn">Show Streamer Logs</button>
+            <button data-log="icecast" class="logBtn">Show Icecast Logs</button>
+          </div>
+
+          <pre id="controlOutput" class="terminal"></pre>
+        </div>
+
+        <div class="tabPanel" id="tab-talkgroups">
+          <h2>Talkgroup Filters</h2>
+          <div class="toolbar wrap">
             <input id="tgSearch" type="search" placeholder="Search TGID or label" />
             <select id="tgCategory"></select>
-            <label><input id="tgShowEncrypted" type="checkbox" /> Show encrypted</label>
             <label><input id="tgFavoritesOnly" type="checkbox" /> Favorites</label>
+            <label><input id="tgShowEncrypted" type="checkbox" /> Show encrypted</label>
           </div>
-          <div class="toolbar">
+          <div class="toolbar wrap">
             <select id="bulkCategory"></select>
             <button id="bulkEnableBtn">Enable Category</button>
             <button id="bulkDisableBtn">Disable Category</button>
             <button id="saveTgBtn">Save Talkgroups</button>
           </div>
+
           <div class="tableWrap">
             <table>
               <thead>
@@ -74,6 +107,7 @@
               <tbody id="tgTable"></tbody>
             </table>
           </div>
+
           <div class="pager">
             <button id="prevPageBtn">Prev</button>
             <span id="pageInfo" class="muted"></span>
@@ -81,56 +115,67 @@
           </div>
         </div>
 
-        <div class="tabPanel" id="tab-builder">
+        <div class="tabPanel" id="tab-imports">
+          <h2>Profile Imports</h2>
+          <p class="muted">Import user-supplied CSV/JSON only. No scraping workflow is provided.</p>
+
           <div class="toolbar wrap">
             <label>Profile
-              <select id="builderProfile">
+              <select id="importProfile">
                 <option value="AZDPS">AZDPS</option>
                 <option value="MCSO">MCSO</option>
               </select>
             </label>
-            <label>Label <input id="builderLabel" type="text" placeholder="Arizona DPS" /></label>
-            <label>System Name <input id="builderSystemName" type="text" placeholder="AZ DPS" /></label>
-            <label>SysID <input id="builderSysid" type="text" placeholder="123" /></label>
-            <label>WACN <input id="builderWacn" type="text" placeholder="BEE00" /></label>
-            <label>NAC <input id="builderNac" type="text" placeholder="293" /></label>
-            <label>Bandplan <input id="builderBandplan" type="text" placeholder="P25 Auto" /></label>
-            <label>Site Name <input id="builderSiteName" type="text" placeholder="Main Site" /></label>
-            <label>Control Channels (;)
-              <input id="builderControlChannels" type="text" placeholder="771.10625;771.35625" />
-            </label>
-            <label>Alternate Channels (;)
-              <input id="builderAlternateChannels" type="text" placeholder="770.85625" />
-            </label>
+            <button id="copySitesTemplateBtn">Copy Sites CSV Template</button>
+            <button id="copyTgTemplateBtn">Copy TG CSV Template</button>
+            <button id="loadJsonBtn">Import from /data/profiles JSON</button>
           </div>
 
-          <p class="muted">CSV headers: <code>tgid,label,mode,encrypted,category,favorite,enabled</code></p>
-          <textarea id="builderCsv" rows="9" placeholder="Paste talkgroup CSV here"></textarea>
-          <div class="row">
-            <input id="builderFile" type="file" accept=".csv,.txt,.json,application/json,text/csv" />
-            <button id="previewImportBtn">Preview Import</button>
-            <button id="saveImportBtn">Save Profile + Talkgroups</button>
-            <button id="jsonImportBtn">Import from /data/profiles JSON</button>
+          <div class="importGrid">
+            <section class="card innerCard">
+              <h3>Sites/Control Channels CSV</h3>
+              <p class="muted">Required: <code>site_name,control_freq</code>. Optional: <code>alt_freqs,nac,sysid,wacn,bandplan</code>.</p>
+              <textarea id="sitesCsv" rows="7" placeholder="Paste sites CSV"></textarea>
+              <div class="toolbar wrap">
+                <input id="sitesFile" type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values" />
+                <button id="previewSitesBtn">Preview Sites</button>
+                <button id="saveSitesBtn">Save Sites</button>
+              </div>
+            </section>
+
+            <section class="card innerCard">
+              <h3>Talkgroups CSV</h3>
+              <p class="muted">Required: <code>tgid,label</code>. Optional: <code>mode,encrypted,category,favorite,enabled</code>.</p>
+              <textarea id="tgCsv" rows="7" placeholder="Paste talkgroups CSV"></textarea>
+              <div class="toolbar wrap">
+                <input id="tgFile" type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values" />
+                <button id="previewTgBtn">Preview TGs</button>
+                <button id="saveTgImportBtn">Save TGs</button>
+              </div>
+            </section>
           </div>
-          <p id="builderMsg" class="muted"></p>
-          <div id="builderErrors" class="errorBox"></div>
+
+          <p id="importMsg" class="muted"></p>
+          <div id="importErrors" class="errorBox"></div>
+
           <div class="tableWrap">
             <table>
               <thead>
                 <tr>
-                  <th>TGID</th>
-                  <th>Label</th>
-                  <th>Mode</th>
-                  <th>Encrypted</th>
-                  <th>Category</th>
+                  <th>Type</th>
+                  <th>Value 1</th>
+                  <th>Value 2</th>
+                  <th>Value 3</th>
+                  <th>Value 4</th>
                 </tr>
               </thead>
-              <tbody id="previewTable"></tbody>
+              <tbody id="importPreviewTable"></tbody>
             </table>
           </div>
         </div>
 
         <div class="tabPanel" id="tab-audio">
+          <h2>Audio</h2>
           <audio id="audioPlayer" controls preload="none"></audio>
         </div>
       </section>
