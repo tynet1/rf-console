@@ -37,8 +37,11 @@
             <div><span>Last TG</span><strong id="lastTg">-</strong></div>
             <div><span>Locked</span><strong id="locked">-</strong></div>
             <div><span>Last Decode</span><strong id="lastDecode">-</strong></div>
+            <div><span>Last Exit Code</span><strong id="lastExitCode">-</strong></div>
             <div><span>Last Update</span><strong id="updated">-</strong></div>
           </div>
+          <h2>OP25 Error Tail</h2>
+          <pre id="op25ErrorTail" class="terminal"></pre>
         </div>
 
         <div class="tabPanel" id="tab-controls">
@@ -47,6 +50,7 @@
             <label>Admin Token <input id="adminToken" type="password" placeholder="required for control actions" /></label>
             <button id="saveTokenBtn">Save Token</button>
             <button id="checkControlBtn">Check Control Access</button>
+            <button id="validateProfileBtn">Validate Active Profile</button>
           </div>
           <div class="toolbar wrap">
             <label>Profile

@@ -5,9 +5,9 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 FREQ_RE = re.compile(r"(?:freq|frequency)[^0-9]*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
@@ -17,25 +17,43 @@ WACN_RE = re.compile(r"wacn[^0-9a-fA-F]*([0-9a-fA-F]+)", re.IGNORECASE)
 NAC_RE = re.compile(r"nac[^0-9a-fA-F]*([0-9a-fA-F]+)", re.IGNORECASE)
 TG_RE = re.compile(r"(?:tg|talkgroup|tgid)[^0-9]*([0-9]+)", re.IGNORECASE)
 LOCK_RE = re.compile(r"(?:locked|sync|tracking|lock)", re.IGNORECASE)
-UNLOCK_RE = re.compile(r"(?:no\\s+lock|unlock|searching|hunt)", re.IGNORECASE)
+UNLOCK_RE = re.compile(r"(?:no\s+lock|unlock|searching|hunt)", re.IGNORECASE)
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class Supervisor:
-    def __init__(self, profiles_dir: Path, runtime_dir: Path, active_profile_file: Path):
+    def __init__(self, profiles_dir: Path, runtime_dir: Path, active_profile_file: Path, op25_cwd: Path, op25_pythonpath: str):
         self.profiles_dir = profiles_dir
         self.runtime_dir = runtime_dir
         self.active_profile_file = active_profile_file
+        self.legacy_active_profile_file = runtime_dir / "active_profile.json"
+        self.op25_cwd = op25_cwd
+        self.op25_pythonpath = op25_pythonpath
+
         self.status_file = runtime_dir / "op25-status.json"
         self.reload_file = runtime_dir / "reload-request.json"
+        self.child_log_file = runtime_dir / "op25-child.log"
+
         self.proc = None
         self.proc_lock = threading.Lock()
         self.active_profile = None
         self.last_reload_mtime = 0.0
         self.stop_requested = False
+
+        self.error_tail = deque(maxlen=100)
+        self.child_log_handle = None
+
         self.status = {
             "running": False,
             "locked": False,
             "lastDecodeTime": None,
+            "lastExitCode": None,
+            "lastStartCommand": None,
+            "lastErrorTail": "",
+            "timestamp": None,
             "startedAt": None,
             "lastUpdated": None,
             "currentControlFrequency": None,
@@ -46,9 +64,26 @@ class Supervisor:
         }
 
     def write_status(self):
-        self.status["lastUpdated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.status["lastUpdated"] = now_iso()
+        self.status["timestamp"] = self.status["lastUpdated"]
+        self.status["lastErrorTail"] = "\n".join(self.error_tail)
         payload = json.dumps(self.status, indent=2) + "\n"
         self.status_file.write_text(payload)
+
+    def migrate_active_profile_legacy(self):
+        if self.active_profile_file.exists():
+            return
+        if not self.legacy_active_profile_file.exists():
+            return
+        try:
+            data = json.loads(self.legacy_active_profile_file.read_text())
+            self.active_profile_file.write_text(json.dumps(data, indent=2) + "\n")
+            self.legacy_active_profile_file.unlink(missing_ok=True)
+            self.status["note"] = "migrated legacy active_profile.json -> active-profile.json"
+            self.write_status()
+        except Exception as exc:
+            self.status["note"] = f"legacy active profile migration failed: {exc}"
+            self.write_status()
 
     def read_active_profile(self):
         if not self.active_profile_file.exists():
@@ -87,11 +122,20 @@ class Supervisor:
             rendered.append(token)
         return rendered
 
-    def parse_line(self, line):
-        text = line.strip()
+    def write_child_line(self, text):
         if not text:
             return
+        self.error_tail.append(text)
+        if self.child_log_handle:
+            self.child_log_handle.write(text + "\n")
+            self.child_log_handle.flush()
 
+    def parse_line(self, line):
+        text = line.rstrip("\n")
+        if text == "":
+            return
+
+        self.write_child_line(text)
         self.status["note"] = text[-220:]
 
         m = FREQ_RE.search(text)
@@ -124,7 +168,7 @@ class Supervisor:
             self.status["talkgroup"]["current"] = tg
             if prev and prev != tg:
                 self.status["talkgroup"]["last"] = prev
-            self.status["lastDecodeTime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.status["lastDecodeTime"] = now_iso()
 
         if LOCK_RE.search(text):
             self.status["locked"] = True
@@ -157,16 +201,30 @@ class Supervisor:
         self.status["running"] = False
         self.status["locked"] = False
         self.status["startedAt"] = None
+        self.status["lastExitCode"] = proc.returncode
+        self.status["note"] = f"stopped process exit={proc.returncode}"
         self.write_status()
 
     def start_process(self, profile):
         cmd = self.build_command(profile)
+        self.error_tail.clear()
+        if self.child_log_handle is None:
+            self.child_log_handle = self.child_log_file.open("a", encoding="utf-8")
+
+        env = None
+        if self.op25_pythonpath:
+            env = dict(os.environ)
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = self.op25_pythonpath if not existing else f"{self.op25_pythonpath}:{existing}"
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            cwd=str(self.op25_cwd),
+            env=env,
         )
 
         with self.proc_lock:
@@ -174,7 +232,9 @@ class Supervisor:
 
         self.status["running"] = True
         self.status["locked"] = False
-        self.status["startedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.status["startedAt"] = now_iso()
+        self.status["lastExitCode"] = None
+        self.status["lastStartCommand"] = " ".join(cmd)
         self.status["note"] = f"running profile {profile}"
         self.write_status()
 
@@ -184,6 +244,8 @@ class Supervisor:
     def run(self):
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
+        self.migrate_active_profile_legacy()
+
         if self.reload_file.exists():
             self.last_reload_mtime = self.reload_file.stat().st_mtime
         self.write_status()
@@ -206,7 +268,9 @@ class Supervisor:
                         self.start_process(desired)
                     except Exception as exc:
                         self.status["running"] = False
+                        self.status["lastExitCode"] = 127
                         self.status["note"] = f"start failed for {desired}: {exc}"
+                        self.write_child_line(self.status["note"])
                         self.write_status()
 
             with self.proc_lock:
@@ -217,7 +281,11 @@ class Supervisor:
                 with self.proc_lock:
                     self.proc = None
                 self.status["running"] = False
+                self.status["locked"] = False
+                self.status["startedAt"] = None
+                self.status["lastExitCode"] = code
                 self.status["note"] = f"process exited with code {code}; retrying"
+                self.write_child_line(self.status["note"])
                 self.write_status()
                 time.sleep(2)
                 continue
@@ -225,6 +293,9 @@ class Supervisor:
             time.sleep(1)
 
         self.stop_process()
+        if self.child_log_handle is not None:
+            self.child_log_handle.close()
+            self.child_log_handle = None
 
     def request_stop(self, *_args):
         self.stop_requested = True
@@ -247,6 +318,16 @@ def parse_args():
         default="",
         help="optional explicit active profile file path",
     )
+    parser.add_argument(
+        "--op25-cwd",
+        default="/opt/src/op25/op25/gr-op25_repeater/apps",
+        help="working directory for launching OP25 rx.py",
+    )
+    parser.add_argument(
+        "--op25-pythonpath",
+        default="",
+        help="optional PYTHONPATH prefix for OP25 child process",
+    )
     return parser.parse_args()
 
 
@@ -256,7 +337,13 @@ def main():
     runtime_dir = Path(args.runtime_dir)
     active_file = Path(args.active_profile_file) if args.active_profile_file else runtime_dir / "active-profile.json"
 
-    sup = Supervisor(profiles_dir, runtime_dir, active_file)
+    sup = Supervisor(
+        profiles_dir=profiles_dir,
+        runtime_dir=runtime_dir,
+        active_profile_file=active_file,
+        op25_cwd=Path(args.op25_cwd),
+        op25_pythonpath=args.op25_pythonpath,
+    )
     signal.signal(signal.SIGTERM, sup.request_stop)
     signal.signal(signal.SIGINT, sup.request_stop)
     sup.run()

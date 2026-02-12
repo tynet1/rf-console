@@ -134,6 +134,41 @@ class Handler(BaseHTTPRequestHandler):
         }
         return commands.get(target)
 
+    def _service_snapshot(self):
+        op25_state = run_command(f"systemctl is-active {shlex.quote(self.op25_service)}", timeout=5)
+        helper_state = run_command("systemctl is-active rf-control-helper.service", timeout=5)
+        icecast_state = run_command("docker inspect -f '{{.State.Status}}' rf-console-icecast", timeout=5)
+        streamer_state = run_command("docker inspect -f '{{.State.Status}}' rf-console-streamer", timeout=5)
+        rx_state = run_command("pgrep -af 'rx.py' >/dev/null 2>&1", timeout=5)
+
+        return {
+            "op25-supervisor": {
+                "state": (op25_state.get("stdout") or op25_state.get("stderr") or "unknown").strip() or "unknown",
+                "message": (op25_state.get("stdout") or op25_state.get("stderr") or "unknown").strip(),
+                "exitCode": op25_state.get("exitCode"),
+            },
+            "rf-control-helper": {
+                "state": (helper_state.get("stdout") or helper_state.get("stderr") or "unknown").strip() or "unknown",
+                "message": (helper_state.get("stdout") or helper_state.get("stderr") or "unknown").strip(),
+                "exitCode": helper_state.get("exitCode"),
+            },
+            "icecast": {
+                "state": (icecast_state.get("stdout") or "unknown").strip() or "unknown",
+                "message": (icecast_state.get("stdout") or icecast_state.get("stderr") or "unknown").strip(),
+                "exitCode": icecast_state.get("exitCode"),
+            },
+            "streamer": {
+                "state": (streamer_state.get("stdout") or "unknown").strip() or "unknown",
+                "message": (streamer_state.get("stdout") or streamer_state.get("stderr") or "unknown").strip(),
+                "exitCode": streamer_state.get("exitCode"),
+            },
+            "rx.py": {
+                "running": rx_state.get("ok", False),
+                "message": "rx.py running" if rx_state.get("ok", False) else "rx.py not running",
+                "exitCode": rx_state.get("exitCode"),
+            },
+        }
+
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/health":
@@ -155,6 +190,19 @@ class Handler(BaseHTTPRequestHandler):
                         "rtlSdrInPath": rtl_path.get("ok", False),
                         "rtlUsbPresent": usb.get("ok", False),
                     },
+                },
+            )
+            return
+
+        if parsed.path == "/services":
+            if not self._auth():
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "ts": ts_iso(),
+                    "services": self._service_snapshot(),
                 },
             )
             return

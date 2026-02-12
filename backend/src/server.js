@@ -10,6 +10,7 @@ const DATA_DIR = process.env.DATA_DIR || '/data';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const RUNTIME_DIR = path.join(DATA_DIR, 'runtime');
 const ACTIVE_PROFILE_FILE = path.join(RUNTIME_DIR, 'active-profile.json');
+const ACTIVE_PROFILE_LEGACY_FILE = path.join(RUNTIME_DIR, 'active_profile.json');
 const STATUS_FILE = path.join(RUNTIME_DIR, 'op25-status.json');
 const RELOAD_FILE = path.join(RUNTIME_DIR, 'reload-request.json');
 const STREAM_URL = process.env.STREAM_URL || 'http://localhost:8000/stream';
@@ -70,6 +71,21 @@ function activeProfile() {
     return null;
   }
   return state.profile;
+}
+
+function migrateLegacyActiveProfile() {
+  if (fs.existsSync(ACTIVE_PROFILE_FILE) || !fs.existsSync(ACTIVE_PROFILE_LEGACY_FILE)) {
+    return;
+  }
+  try {
+    const legacy = readJson(ACTIVE_PROFILE_LEGACY_FILE, null);
+    if (legacy && isSafeProfileName(legacy.profile)) {
+      writeJson(ACTIVE_PROFILE_FILE, legacy);
+      fs.unlinkSync(ACTIVE_PROFILE_LEGACY_FILE);
+    }
+  } catch {
+    // keep legacy file untouched on failure
+  }
 }
 
 function clampText(value, max = 128) {
@@ -304,7 +320,81 @@ function persistTalkgroups(profile, entries) {
     profile,
     filter: doc.filter
   });
+  writeTagsTsv(profile, doc.entries);
   return doc;
+}
+
+function quoteTsv(value) {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function writeTagsTsv(profile, entries) {
+  const out = [];
+  out.push([quoteTsv('tgid'), quoteTsv('tag'), quoteTsv('mode')].join('\t'));
+  entries.forEach((entry) => {
+    out.push([
+      quoteTsv(entry.tgid),
+      quoteTsv(entry.label || ''),
+      quoteTsv(entry.mode || 'D')
+    ].join('\t'));
+  });
+  fs.writeFileSync(path.join(PROFILES_DIR, `${profile}.tags.tsv`), out.join('\n') + '\n', 'utf8');
+}
+
+function ensureTagsFile(profile) {
+  const tagsPath = path.join(PROFILES_DIR, `${profile}.tags.tsv`);
+  if (fs.existsSync(tagsPath)) {
+    return;
+  }
+  const existingTalkgroups = readJson(talkgroupsFile(profile), { entries: [] });
+  writeTagsTsv(profile, Array.isArray(existingTalkgroups.entries) ? existingTalkgroups.entries : []);
+}
+
+function writeTrunkTsv(profile, sites, profileDoc = {}) {
+  const tagFile = `${profile}.tags.tsv`;
+  const out = [];
+  out.push([
+    quoteTsv('sysname'),
+    quoteTsv('site_name'),
+    quoteTsv('control_channel_list'),
+    quoteTsv('alt_channel_list'),
+    quoteTsv('nac'),
+    quoteTsv('sysid'),
+    quoteTsv('wacn'),
+    quoteTsv('bandplan'),
+    quoteTsv('tags_file')
+  ].join('\t'));
+
+  sites.forEach((site) => {
+    out.push([
+      quoteTsv(profileDoc.system?.name || profile),
+      quoteTsv(site.name || ''),
+      quoteTsv((site.controlChannels || []).join(',')),
+      quoteTsv((site.alternateChannels || []).join(',')),
+      quoteTsv(site.nac || profileDoc.system?.nac || ''),
+      quoteTsv(site.sysid || profileDoc.system?.sysid || ''),
+      quoteTsv(site.wacn || profileDoc.system?.wacn || ''),
+      quoteTsv(site.bandplan || profileDoc.system?.bandplan || 'P25 Auto'),
+      quoteTsv(tagFile)
+    ].join('\t'));
+  });
+  fs.writeFileSync(path.join(PROFILES_DIR, `${profile}.trunk.tsv`), out.join('\n') + '\n', 'utf8');
+}
+
+function normalizeCommandForTrunk(profile, command) {
+  if (!Array.isArray(command)) {
+    return command;
+  }
+  return command.map((token) => {
+    if (typeof token !== 'string') {
+      return token;
+    }
+    const oldTemplate = `{PROFILES_DIR}/${profile}.tsv`;
+    if (token === oldTemplate) {
+      return `{PROFILES_DIR}/${profile}.trunk.tsv`;
+    }
+    return token.replace(new RegExp(`${profile}\\.tsv`, 'g'), `${profile}.trunk.tsv`);
+  });
 }
 
 function triggerReload(reason, profile = activeProfile()) {
@@ -313,6 +403,147 @@ function triggerReload(reason, profile = activeProfile()) {
     reason,
     profile: profile || null
   });
+}
+
+function parseQuotedTsvLine(line) {
+  const fields = [];
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== '"') {
+      return { ok: false, error: 'field must start with double quote' };
+    }
+    i += 1;
+    let value = '';
+    while (i < line.length) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          value += '"';
+          i += 2;
+          continue;
+        }
+        i += 1;
+        break;
+      }
+      value += ch;
+      i += 1;
+    }
+
+    fields.push(value);
+    if (i === line.length) {
+      break;
+    }
+    if (line[i] !== '\t') {
+      return { ok: false, error: 'fields must be tab-separated quoted values' };
+    }
+    i += 1;
+  }
+  return { ok: true, fields };
+}
+
+function findTagFilesInFields(fields) {
+  return fields
+    .filter((f) => typeof f === 'string' && f.toLowerCase().endsWith('.tags.tsv'))
+    .map((f) => f.trim())
+    .filter(Boolean);
+}
+
+function migrateLegacyTrunkFile(profile) {
+  const trunkPath = path.join(PROFILES_DIR, `${profile}.trunk.tsv`);
+  if (fs.existsSync(trunkPath)) {
+    return;
+  }
+  const legacyPath = path.join(PROFILES_DIR, `${profile}.tsv`);
+  if (!fs.existsSync(legacyPath)) {
+    return;
+  }
+  try {
+    fs.copyFileSync(legacyPath, trunkPath);
+  } catch {
+    // leave as-is on migration failure
+  }
+}
+
+function validateProfileFiles(profile) {
+  migrateLegacyTrunkFile(profile);
+  ensureTagsFile(profile);
+  const trunkFileName = `${profile}.trunk.tsv`;
+  const trunkPath = path.join(PROFILES_DIR, trunkFileName);
+
+  if (!fs.existsSync(trunkPath)) {
+    return {
+      ok: false,
+      error: `Missing required trunk file: ${trunkFileName}`,
+      firstError: `Missing required trunk file: ${trunkFileName}`
+    };
+  }
+
+  const lines = fs.readFileSync(trunkPath, 'utf8')
+    .replace(/\r/g, '')
+    .split('\n');
+
+  let expectedCols = null;
+  let firstError = null;
+  const referencedTags = new Set();
+  let parsedRows = 0;
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const raw = lines[idx].trim();
+    if (!raw || raw.startsWith('#')) {
+      continue;
+    }
+
+    const parsed = parseQuotedTsvLine(raw);
+    if (!parsed.ok) {
+      firstError = `Line ${idx + 1}: ${parsed.error}`;
+      break;
+    }
+
+    if (expectedCols == null) {
+      expectedCols = parsed.fields.length;
+      if (expectedCols < 2) {
+        firstError = `Line ${idx + 1}: trunk.tsv has invalid column count (${expectedCols})`;
+        break;
+      }
+    } else if (parsed.fields.length !== expectedCols) {
+      firstError = `Line ${idx + 1}: expected ${expectedCols} columns but found ${parsed.fields.length}`;
+      break;
+    }
+
+    parsedRows += 1;
+    findTagFilesInFields(parsed.fields).forEach((tag) => referencedTags.add(tag));
+  }
+
+  if (!firstError && parsedRows === 0) {
+    firstError = 'No usable rows found in trunk.tsv';
+  }
+
+  if (!firstError && referencedTags.size === 0) {
+    referencedTags.add(`${profile}.tags.tsv`);
+  }
+
+  if (!firstError) {
+    for (const tag of referencedTags) {
+      const full = path.isAbsolute(tag) ? tag : path.join(PROFILES_DIR, tag);
+      if (!fs.existsSync(full)) {
+        firstError = `Referenced tag file is missing: ${tag}`;
+        break;
+      }
+    }
+  }
+
+  return {
+    ok: !firstError,
+    error: firstError,
+    firstError,
+    details: {
+      profile,
+      trunkFile: trunkFileName,
+      parsedRows,
+      expectedColumns: expectedCols,
+      referencedTagFiles: Array.from(referencedTags)
+    }
+  };
 }
 
 function readProfileSummary(name) {
@@ -554,12 +785,108 @@ async function buildHealth() {
   };
 }
 
+function lightForServiceState(value) {
+  const v = String(value || '').toLowerCase();
+  if (['active', 'running', 'up', 'true', 'healthy'].includes(v)) {
+    return 'green';
+  }
+  if (['unknown', 'n/a', 'unavailable'].includes(v)) {
+    return 'yellow';
+  }
+  return 'red';
+}
+
+async function buildServices() {
+  const checkedAt = nowIso();
+  const helper = await callHostHelper('GET', '/services');
+  const status = readJson(STATUS_FILE, {});
+
+  if (helper.ok && helper.data?.services) {
+    const svc = helper.data.services;
+    return {
+      ts: checkedAt,
+      source: 'host-helper',
+      services: {
+        'op25-supervisor': {
+          status: lightForServiceState(svc['op25-supervisor']?.state),
+          message: svc['op25-supervisor']?.message || svc['op25-supervisor']?.state || 'unknown',
+          raw: svc['op25-supervisor'] || {}
+        },
+        'rf-control-helper': {
+          status: lightForServiceState(svc['rf-control-helper']?.state),
+          message: svc['rf-control-helper']?.message || svc['rf-control-helper']?.state || 'unknown',
+          raw: svc['rf-control-helper'] || {}
+        },
+        icecast: {
+          status: lightForServiceState(svc.icecast?.state),
+          message: svc.icecast?.message || svc.icecast?.state || 'unknown',
+          raw: svc.icecast || {}
+        },
+        streamer: {
+          status: lightForServiceState(svc.streamer?.state),
+          message: svc.streamer?.message || svc.streamer?.state || 'unknown',
+          raw: svc.streamer || {}
+        },
+        'rx.py': {
+          status: svc['rx.py']?.running ? 'green' : 'red',
+          message: svc['rx.py']?.running ? 'rx.py process detected' : 'rx.py process not detected',
+          raw: svc['rx.py'] || {}
+        }
+      }
+    };
+  }
+
+  return {
+    ts: checkedAt,
+    source: 'backend-fallback',
+    services: {
+      'op25-supervisor': {
+        status: 'yellow',
+        message: 'requires host helper for systemd status',
+        raw: {}
+      },
+      'rf-control-helper': {
+        status: 'yellow',
+        message: 'not detected from backend container',
+        raw: {}
+      },
+      icecast: {
+        status: 'yellow',
+        message: 'requires host helper for docker container state',
+        raw: {}
+      },
+      streamer: {
+        status: 'yellow',
+        message: 'requires host helper for docker container state',
+        raw: {}
+      },
+      'rx.py': {
+        status: status.running ? 'yellow' : 'red',
+        message: status.running ? 'supervisor reports OP25 running' : 'OP25 not running',
+        raw: { running: !!status.running }
+      }
+    }
+  };
+}
+
 app.use(express.json({ limit: '6mb' }));
 app.use(express.static('/app/public'));
 
 app.get('/api/profiles', (_req, res) => {
   const profiles = listProfiles().map(readProfileSummary);
   res.json({ profiles, activeProfile: activeProfile() });
+});
+
+app.get('/api/validate-profile/:profile', (req, res) => {
+  const profile = req.params.profile;
+  if (!isSafeProfileName(profile)) {
+    return res.status(400).json({ ok: false, error: 'Invalid profile name' });
+  }
+  const result = validateProfileFiles(profile);
+  if (!result.ok) {
+    return res.status(400).json(result);
+  }
+  return res.json(result);
 });
 
 app.post('/api/profiles/switch', (req, res) => {
@@ -636,7 +963,7 @@ app.post('/api/import/sites/:profile/save', (req, res) => {
       sites: parsed.sites
     },
     command: Array.isArray(existing.command) && existing.command.length > 0
-      ? existing.command
+      ? normalizeCommandForTrunk(profile, existing.command)
       : [
         'python3',
         '/opt/op25/op25/gr-op25_repeater/apps/rx.py',
@@ -645,7 +972,7 @@ app.post('/api/import/sites/:profile/save', (req, res) => {
         '-S',
         '2400000',
         '-T',
-        `{PROFILES_DIR}/${profile}.tsv`,
+        `{PROFILES_DIR}/${profile}.trunk.tsv`,
         '-2',
         '-V',
         '-O',
@@ -657,6 +984,8 @@ app.post('/api/import/sites/:profile/save', (req, res) => {
   };
 
   writeJson(profileFile(profile), updated);
+  ensureTagsFile(profile);
+  writeTrunkTsv(profile, parsed.sites, updated);
   triggerReload('sites-import', profile);
   return res.json({ ok: true, profile, sites: parsed.sites.length });
 });
@@ -714,8 +1043,8 @@ app.post('/api/import/profile/:profile/from-json-file', (req, res) => {
     description: raw.description || `${profile} imported profile`,
     notes: raw.notes || 'Imported from user JSON',
     system: raw.system,
-    command: Array.isArray(raw.command) && raw.command.length > 0 ? raw.command : [
-      'python3', '/opt/op25/op25/gr-op25_repeater/apps/rx.py', '--args', 'rtl', '-S', '2400000', '-T', `{PROFILES_DIR}/${profile}.tsv`, '-2', '-V', '-O', 'plughw:Loopback,0,0', '-U'
+    command: Array.isArray(raw.command) && raw.command.length > 0 ? normalizeCommandForTrunk(profile, raw.command) : [
+      'python3', '/opt/op25/op25/gr-op25_repeater/apps/rx.py', '--args', 'rtl', '-S', '2400000', '-T', `{PROFILES_DIR}/${profile}.trunk.tsv`, '-2', '-V', '-O', 'plughw:Loopback,0,0', '-U'
     ],
     updatedAt: nowIso(),
     importSource: `json-file:${fileName}`
@@ -727,6 +1056,7 @@ app.post('/api/import/profile/:profile/from-json-file', (req, res) => {
   }
 
   const saved = persistTalkgroups(profile, normalized.entries);
+  writeTrunkTsv(profile, raw.system.sites, raw);
   triggerReload('profile-json-import', profile);
   return res.json({ ok: true, profile, fileName, talkgroups: saved.entries.length, filter: saved.filter });
 });
@@ -775,6 +1105,22 @@ app.post('/api/control/action', guardControl, async (req, res) => {
     return res.status(400).json({ ok: false, error: `Unsupported action: ${action}` });
   }
 
+  if (action === 'start-op25' || action === 'restart-op25') {
+    const profile = activeProfile();
+    if (!profile) {
+      return res.status(400).json({ ok: false, action, error: 'No active profile selected' });
+    }
+    const validation = validateProfileFiles(profile);
+    if (!validation.ok) {
+      return res.status(400).json({
+        ok: false,
+        action,
+        error: `Profile validation failed: ${validation.firstError}`,
+        validation
+      });
+    }
+  }
+
   const helper = await callHostHelper('POST', `/action/${encodeURIComponent(action)}`);
   if (helper.ok) {
     return res.json(helper.data);
@@ -809,6 +1155,11 @@ app.get('/api/health', async (_req, res) => {
   res.json(data);
 });
 
+app.get('/services', async (_req, res) => {
+  const data = await buildServices();
+  res.json(data);
+});
+
 app.get('/api/status', (_req, res) => {
   const status = readJson(STATUS_FILE, {});
   res.json({
@@ -818,6 +1169,10 @@ app.get('/api/status', (_req, res) => {
       running: !!status.running,
       locked: !!status.locked,
       lastDecodeTime: status.lastDecodeTime || null,
+      lastExitCode: status.lastExitCode ?? null,
+      lastStartCommand: status.lastStartCommand || null,
+      lastErrorTail: status.lastErrorTail || '',
+      timestamp: status.timestamp || null,
       startedAt: status.startedAt || null,
       lastUpdated: status.lastUpdated || null,
       currentControlFrequency: status.currentControlFrequency || null,
@@ -845,6 +1200,7 @@ app.use((_req, res) => {
 });
 
 ensureDirs();
+migrateLegacyActiveProfile();
 if (!fs.existsSync(ACTIVE_PROFILE_FILE)) {
   const names = listProfiles();
   if (names.length > 0) {

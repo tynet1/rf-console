@@ -21,12 +21,15 @@ const el = {
   lastTg: document.getElementById('lastTg'),
   locked: document.getElementById('locked'),
   lastDecode: document.getElementById('lastDecode'),
+  lastExitCode: document.getElementById('lastExitCode'),
   updated: document.getElementById('updated'),
+  op25ErrorTail: document.getElementById('op25ErrorTail'),
   profileSelect: document.getElementById('profileSelect'),
   switchBtn: document.getElementById('switchBtn'),
   adminToken: document.getElementById('adminToken'),
   saveTokenBtn: document.getElementById('saveTokenBtn'),
   checkControlBtn: document.getElementById('checkControlBtn'),
+  validateProfileBtn: document.getElementById('validateProfileBtn'),
   controlMsg: document.getElementById('controlMsg'),
   controlOutput: document.getElementById('controlOutput'),
   tgSearch: document.getElementById('tgSearch'),
@@ -100,10 +103,15 @@ function appendOutput(text) {
   el.controlOutput.textContent = `[${stamp}] ${text}\n\n${el.controlOutput.textContent}`;
 }
 
-function renderHealth(health) {
-  const checks = health.checks || {};
+function renderHealth(servicePayload) {
+  const checks = servicePayload.services || {};
   el.healthGrid.innerHTML = '';
-  Object.entries(checks).forEach(([name, info]) => {
+  Object.entries(checks).forEach(([name, infoRaw]) => {
+    const info = {
+      status: infoRaw.status || 'yellow',
+      message: infoRaw.message || 'unknown',
+      checked: servicePayload.ts || '-'
+    };
     const row = document.createElement('div');
     row.className = 'healthItem';
     row.innerHTML = `
@@ -111,7 +119,7 @@ function renderHealth(health) {
       <div>
         <strong>${name}</strong>
         <div class="muted">${info.message || '-'}</div>
-        <div class="muted">checked: ${info.last_checked || '-'}</div>
+        <div class="muted">checked: ${info.checked || '-'}</div>
       </div>
     `;
     el.healthGrid.appendChild(row);
@@ -120,8 +128,8 @@ function renderHealth(health) {
 
 async function refreshHealth() {
   try {
-    const health = await fetchJson('/api/health');
-    renderHealth(health);
+    const services = await fetchJson('/services');
+    renderHealth(services);
   } catch (err) {
     el.healthGrid.innerHTML = `<div class="healthItem"><span class="light red"></span><div><strong>health</strong><div class="muted">${err.message}</div></div></div>`;
   }
@@ -141,7 +149,9 @@ async function refreshStatus() {
     setText(el.lastTg, data.status.talkgroup.last);
     setText(el.locked, data.status.locked ? 'Yes' : 'No');
     setText(el.lastDecode, data.status.lastDecodeTime);
+    setText(el.lastExitCode, data.status.lastExitCode);
     setText(el.updated, data.status.lastUpdated);
+    setText(el.op25ErrorTail, data.status.lastErrorTail || '(no OP25 output captured yet)');
     el.audioPlayer.src = data.streamUrl;
   } catch (err) {
     appendOutput(`Status error: ${err.message}`);
@@ -313,7 +323,27 @@ async function loadTemplates() {
   state.templates = await fetchJson('/api/import/templates');
 }
 
+async function validateProfile(profile) {
+  try {
+    const result = await fetchJson(`/api/validate-profile/${encodeURIComponent(profile)}`);
+    el.controlMsg.textContent = `Profile ${profile} validation: OK (${result.details?.parsedRows || 0} rows)`;
+    return { ok: true, result };
+  } catch (err) {
+    el.controlMsg.textContent = `Profile ${profile} validation failed: ${err.message}`;
+    appendOutput(`Validation failed for ${profile}: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 async function doControlAction(action) {
+  const profile = el.profileSelect.value || state.activeProfile;
+  if ((action === 'start-op25' || action === 'restart-op25') && profile) {
+    const validation = await validateProfile(profile);
+    if (!validation.ok) {
+      appendOutput(`Blocked ${action}: profile is invalid`);
+      return;
+    }
+  }
   if (!confirm(`Run action: ${action}?`)) return;
   try {
     const resp = await fetchJson('/api/control/action', {
@@ -367,6 +397,15 @@ function bindEvents() {
     } catch (err) {
       el.controlMsg.textContent = `Control access check failed: ${err.message}`;
     }
+  });
+
+  el.validateProfileBtn.addEventListener('click', async () => {
+    const profile = el.profileSelect.value || state.activeProfile;
+    if (!profile) {
+      el.controlMsg.textContent = 'No profile selected';
+      return;
+    }
+    await validateProfile(profile);
   });
 
   el.switchBtn.addEventListener('click', async () => {
