@@ -37,6 +37,7 @@ services:
   op25:
     build:
       context: ./op25/docker
+    image: rf-console-op25:local
     container_name: rf-console-op25
     restart: unless-stopped
     depends_on:
@@ -47,7 +48,6 @@ services:
       - OP25_ACTIVE_PROFILE_FILE=/runtime/active-profile.json
       - OP25_PROFILES_DIR=/config
       - OP25_ICECAST_URL=http://icecast:8000/stream
-      - OP25_CWD=/opt/src/op25/op25/gr-op25_repeater/apps
     volumes:
       - ./data/profiles:/config:ro
       - ./data/runtime:/runtime
