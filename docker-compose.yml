@@ -15,8 +15,13 @@ services:
       - CONTROL_PRIVATE_ONLY=${CONTROL_PRIVATE_ONLY:-1}
       - HOST_HELPER_URL=${HOST_HELPER_URL:-http://host.docker.internal:9911}
       - HOST_HELPER_TOKEN=${HOST_HELPER_TOKEN:-}
+      - OP25_CONTAINER=rf-console-op25
+      - ICECAST_CONTAINER=rf-console-icecast
+      - STREAMER_CONTAINER=rf-console-streamer
+      - BACKEND_CONTAINER=rf-console-backend
     volumes:
       - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

@@ -2,6 +2,8 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { Buffer } = require('buffer');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 
 const app = express();
 
@@ -20,6 +22,13 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const CONTROL_PRIVATE_ONLY = process.env.CONTROL_PRIVATE_ONLY !== '0';
 const HOST_HELPER_URL = process.env.HOST_HELPER_URL || '';
 const HOST_HELPER_TOKEN = process.env.HOST_HELPER_TOKEN || ADMIN_TOKEN;
+const DOCKER_BIN = process.env.DOCKER_BIN || 'docker';
+const OP25_CONTAINER = process.env.OP25_CONTAINER || 'rf-console-op25';
+const ICECAST_CONTAINER = process.env.ICECAST_CONTAINER || 'rf-console-icecast';
+const STREAMER_CONTAINER = process.env.STREAMER_CONTAINER || 'rf-console-streamer';
+const BACKEND_CONTAINER = process.env.BACKEND_CONTAINER || 'rf-console-backend';
+
+const execFileAsync = promisify(execFile);
 
 const PROFILE_OPTIONS = new Set(['AZDPS', 'MCSO']);
 
@@ -619,6 +628,91 @@ function guardControl(req, res, next) {
   return next();
 }
 
+async function runCommand(bin, args, timeoutMs = 8000) {
+  try {
+    const { stdout, stderr } = await execFileAsync(bin, args, {
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024 * 2
+    });
+    return { ok: true, stdout: (stdout || '').trim(), stderr: (stderr || '').trim(), exitCode: 0 };
+  } catch (err) {
+    return {
+      ok: false,
+      stdout: (err.stdout || '').trim(),
+      stderr: (err.stderr || err.message || '').trim(),
+      exitCode: typeof err.code === 'number' ? err.code : 1
+    };
+  }
+}
+
+async function dockerAvailable() {
+  return runCommand(DOCKER_BIN, ['version', '--format', '{{.Server.Version}}'], 4000);
+}
+
+async function dockerInspect(name) {
+  const result = await runCommand(DOCKER_BIN, ['inspect', name], 6000);
+  if (!result.ok) {
+    return {
+      ok: false,
+      name,
+      status: 'missing',
+      message: result.stderr || result.stdout || 'container missing',
+      uptime: null,
+      lastExitCode: null,
+      running: false
+    };
+  }
+
+  try {
+    const payload = JSON.parse(result.stdout);
+    const state = payload[0]?.State || {};
+    const status = state.Status || 'unknown';
+    const startedAt = state.StartedAt ? Date.parse(state.StartedAt) : null;
+    const uptime = startedAt && Number.isFinite(startedAt)
+      ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+      : null;
+    return {
+      ok: true,
+      name,
+      status,
+      message: status,
+      uptime,
+      running: Boolean(state.Running),
+      lastExitCode: Number.isInteger(state.ExitCode) ? state.ExitCode : null
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      name,
+      status: 'unknown',
+      message: `inspect parse error: ${err.message}`,
+      uptime: null,
+      lastExitCode: null,
+      running: false
+    };
+  }
+}
+
+async function dockerAction(action, containerName) {
+  const cmd = action === 'start'
+    ? ['start', containerName]
+    : action === 'stop'
+      ? ['stop', containerName]
+      : ['restart', containerName];
+  return runCommand(DOCKER_BIN, cmd, 15000);
+}
+
+async function dockerLogsTail(containerName, lines = 200) {
+  return runCommand(DOCKER_BIN, ['logs', '--tail', String(lines), containerName], 12000);
+}
+
+function serviceStatusColor(status) {
+  const s = String(status || '').toLowerCase();
+  if (['running', 'active', 'up', 'healthy'].includes(s)) return 'green';
+  if (['missing', 'unknown'].includes(s)) return 'yellow';
+  return 'red';
+}
+
 async function callHostHelper(method, endpoint, body) {
   if (!HOST_HELPER_URL) {
     return { ok: false, status: 503, error: 'Host helper not configured' };
@@ -785,86 +879,47 @@ async function buildHealth() {
   };
 }
 
-function lightForServiceState(value) {
-  const v = String(value || '').toLowerCase();
-  if (['active', 'running', 'up', 'true', 'healthy'].includes(v)) {
-    return 'green';
-  }
-  if (['unknown', 'n/a', 'unavailable'].includes(v)) {
-    return 'yellow';
-  }
-  return 'red';
-}
-
 async function buildServices() {
   const checkedAt = nowIso();
-  const helper = await callHostHelper('GET', '/services');
-  const status = readJson(STATUS_FILE, {});
-
-  if (helper.ok && helper.data?.services) {
-    const svc = helper.data.services;
+  const docker = await dockerAvailable();
+  if (!docker.ok) {
     return {
       ts: checkedAt,
-      source: 'host-helper',
+      source: 'backend',
+      error: 'Docker CLI unavailable in backend container',
       services: {
-        'op25-supervisor': {
-          status: lightForServiceState(svc['op25-supervisor']?.state),
-          message: svc['op25-supervisor']?.message || svc['op25-supervisor']?.state || 'unknown',
-          raw: svc['op25-supervisor'] || {}
-        },
-        'rf-control-helper': {
-          status: lightForServiceState(svc['rf-control-helper']?.state),
-          message: svc['rf-control-helper']?.message || svc['rf-control-helper']?.state || 'unknown',
-          raw: svc['rf-control-helper'] || {}
-        },
-        icecast: {
-          status: lightForServiceState(svc.icecast?.state),
-          message: svc.icecast?.message || svc.icecast?.state || 'unknown',
-          raw: svc.icecast || {}
-        },
-        streamer: {
-          status: lightForServiceState(svc.streamer?.state),
-          message: svc.streamer?.message || svc.streamer?.state || 'unknown',
-          raw: svc.streamer || {}
-        },
-        'rx.py': {
-          status: svc['rx.py']?.running ? 'green' : 'red',
-          message: svc['rx.py']?.running ? 'rx.py process detected' : 'rx.py process not detected',
-          raw: svc['rx.py'] || {}
-        }
+        backend: { name: 'backend', status: 'green', message: 'running', uptime: null, lastExitCode: null },
+        op25: { name: 'op25', status: 'yellow', message: docker.stderr || docker.stdout || 'docker unavailable', uptime: null, lastExitCode: null },
+        icecast: { name: 'icecast', status: 'yellow', message: 'docker unavailable', uptime: null, lastExitCode: null },
+        streamer: { name: 'streamer', status: 'yellow', message: 'docker unavailable', uptime: null, lastExitCode: null }
       }
     };
   }
 
+  const [op25, icecast, streamer, backend] = await Promise.all([
+    dockerInspect(OP25_CONTAINER),
+    dockerInspect(ICECAST_CONTAINER),
+    dockerInspect(STREAMER_CONTAINER),
+    dockerInspect(BACKEND_CONTAINER)
+  ]);
+
+  const normalize = (svc) => ({
+    name: svc.name,
+    status: serviceStatusColor(svc.status),
+    state: svc.status,
+    message: svc.message,
+    uptime: svc.uptime,
+    lastExitCode: svc.lastExitCode
+  });
+
   return {
     ts: checkedAt,
-    source: 'backend-fallback',
+    source: 'backend',
     services: {
-      'op25-supervisor': {
-        status: 'yellow',
-        message: 'requires host helper for systemd status',
-        raw: {}
-      },
-      'rf-control-helper': {
-        status: 'yellow',
-        message: 'not detected from backend container',
-        raw: {}
-      },
-      icecast: {
-        status: 'yellow',
-        message: 'requires host helper for docker container state',
-        raw: {}
-      },
-      streamer: {
-        status: 'yellow',
-        message: 'requires host helper for docker container state',
-        raw: {}
-      },
-      'rx.py': {
-        status: status.running ? 'yellow' : 'red',
-        message: status.running ? 'supervisor reports OP25 running' : 'OP25 not running',
-        raw: { running: !!status.running }
-      }
+      backend: normalize(backend),
+      op25: normalize(op25),
+      icecast: normalize(icecast),
+      streamer: normalize(streamer)
     }
   };
 }
@@ -889,7 +944,7 @@ app.get('/api/validate-profile/:profile', (req, res) => {
   return res.json(result);
 });
 
-app.post('/api/profiles/switch', (req, res) => {
+app.post('/api/profiles/switch', async (req, res) => {
   const profile = req.body?.profile;
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ error: 'Invalid profile name' });
@@ -897,11 +952,30 @@ app.post('/api/profiles/switch', (req, res) => {
   if (!fs.existsSync(profileFile(profile))) {
     return res.status(404).json({ error: `Profile '${profile}' not found` });
   }
+  const validation = validateProfileFiles(profile);
+  if (!validation.ok) {
+    return res.status(400).json({ ok: false, error: validation.firstError, validation });
+  }
 
   const changedAt = nowIso();
   writeJson(ACTIVE_PROFILE_FILE, { profile, changedAt, changedBy: 'api' });
   triggerReload('profile-switch', profile);
-  return res.json({ ok: true, profile, changedAt });
+
+  const restart = await dockerAction('restart', OP25_CONTAINER);
+  const logs = await dockerLogsTail(OP25_CONTAINER, 200);
+  return res.json({
+    ok: restart.ok,
+    profile,
+    changedAt,
+    validation,
+    restart: {
+      ok: restart.ok,
+      exitCode: restart.exitCode,
+      stdout: restart.stdout,
+      stderr: restart.stderr
+    },
+    logsTail: logs.stdout || logs.stderr || ''
+  });
 });
 
 app.get('/api/talkgroups/:profile', (req, res) => {
@@ -1079,9 +1153,12 @@ app.get('/api/import/templates', (_req, res) => {
 });
 
 app.get('/api/control/capabilities', guardControl, async (_req, res) => {
+  const docker = await dockerAvailable();
   const helper = await callHostHelper('GET', '/health');
   res.json({
     ok: true,
+    dockerAvailable: docker.ok,
+    dockerMessage: docker.ok ? docker.stdout : (docker.stderr || docker.stdout || 'docker unavailable'),
     helperConfigured: Boolean(HOST_HELPER_URL),
     helperReachable: helper.ok,
     helperError: helper.error || helper.data?.error || null
@@ -1091,9 +1168,9 @@ app.get('/api/control/capabilities', guardControl, async (_req, res) => {
 app.post('/api/control/action', guardControl, async (req, res) => {
   const action = String(req.body?.action || '').trim();
   const fallbackCmd = {
-    'start-op25': 'sudo systemctl start op25-supervisor.service',
-    'restart-op25': 'sudo systemctl restart op25-supervisor.service',
-    'stop-op25': 'sudo systemctl stop op25-supervisor.service',
+    'start-op25': `docker start ${OP25_CONTAINER}`,
+    'restart-op25': `docker restart ${OP25_CONTAINER}`,
+    'stop-op25': `docker stop ${OP25_CONTAINER}`,
     'load-alsa-loopback': 'sudo modprobe snd-aloop && grep -i Loopback /proc/asound/cards',
     'usb-sdr-check': 'lsusb | grep -Ei "rtl|realtek"; command -v rtl_sdr',
     'restart-streamer': 'docker restart rf-console-streamer',
@@ -1121,6 +1198,21 @@ app.post('/api/control/action', guardControl, async (req, res) => {
     }
   }
 
+  if (action === 'start-op25' || action === 'restart-op25' || action === 'stop-op25') {
+    const dockerActionName = action === 'start-op25' ? 'start' : action === 'stop-op25' ? 'stop' : 'restart';
+    const op = await dockerAction(dockerActionName, OP25_CONTAINER);
+    const logs = await dockerLogsTail(OP25_CONTAINER, 200);
+    return res.status(op.ok ? 200 : 500).json({
+      ok: op.ok,
+      action,
+      stdout: op.stdout,
+      stderr: op.stderr,
+      exitCode: op.exitCode,
+      logsTail: logs.stdout || logs.stderr || '',
+      ts: nowIso()
+    });
+  }
+
   const helper = await callHostHelper('POST', `/action/${encodeURIComponent(action)}`);
   if (helper.ok) {
     return res.json(helper.data);
@@ -1133,7 +1225,7 @@ app.get('/api/control/logs/:target', guardControl, async (req, res) => {
   const target = String(req.params.target || '').trim();
   const lines = Math.max(10, Math.min(1000, Number(req.query.lines || 200)));
   const fallbackCmd = {
-    op25: 'journalctl -u op25-supervisor.service -n 200 --no-pager',
+    op25: `docker logs --tail=200 ${OP25_CONTAINER}`,
     streamer: 'docker logs --tail=200 rf-console-streamer',
     icecast: 'docker logs --tail=200 rf-console-icecast'
   };
@@ -1142,12 +1234,68 @@ app.get('/api/control/logs/:target', guardControl, async (req, res) => {
     return res.status(400).json({ ok: false, error: `Unsupported log target: ${target}` });
   }
 
+  if (target === 'op25') {
+    const logs = await dockerLogsTail(OP25_CONTAINER, lines);
+    return res.status(logs.ok ? 200 : 500).json({
+      ok: logs.ok,
+      action: 'logs-op25',
+      stdout: logs.stdout,
+      stderr: logs.stderr,
+      exitCode: logs.exitCode,
+      ts: nowIso()
+    });
+  }
+
   const helper = await callHostHelper('GET', `/logs/${encodeURIComponent(target)}?lines=${lines}`);
   if (helper.ok) {
     return res.json(helper.data);
   }
 
   return res.status(503).json(controlFallback(`logs-${target}`, fallbackCmd[target]));
+});
+
+app.post('/api/op25/restart', guardControl, async (_req, res) => {
+  const profile = activeProfile();
+  if (!profile) {
+    return res.status(400).json({ ok: false, error: 'No active profile selected' });
+  }
+  const validation = validateProfileFiles(profile);
+  if (!validation.ok) {
+    return res.status(400).json({ ok: false, error: validation.firstError, validation });
+  }
+  const restart = await dockerAction('restart', OP25_CONTAINER);
+  const logs = await dockerLogsTail(OP25_CONTAINER, 200);
+  return res.json({
+    ok: restart.ok,
+    profile,
+    validation,
+    action: 'restart-op25',
+    exitCode: restart.exitCode,
+    stdout: restart.stdout,
+    stderr: restart.stderr,
+    logsTail: logs.stdout || logs.stderr || '',
+    ts: nowIso()
+  });
+});
+
+app.get('/api/op25/logs-tail', async (req, res) => {
+  const lines = Math.max(10, Math.min(500, Number(req.query.lines || 200)));
+  const logs = await dockerLogsTail(OP25_CONTAINER, lines);
+  if (!logs.ok) {
+    return res.status(503).json({
+      ok: false,
+      lines,
+      error: logs.stderr || logs.stdout || 'Unable to read OP25 container logs',
+      ts: nowIso(),
+      tail: ''
+    });
+  }
+  return res.json({
+    ok: true,
+    lines,
+    ts: nowIso(),
+    tail: logs.stdout || ''
+  });
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -1160,18 +1308,21 @@ app.get('/services', async (_req, res) => {
   res.json(data);
 });
 
-app.get('/api/status', (_req, res) => {
+app.get('/api/status', async (_req, res) => {
   const status = readJson(STATUS_FILE, {});
+  const op25 = await dockerInspect(OP25_CONTAINER);
+  const logs = await dockerLogsTail(OP25_CONTAINER, 120);
+  const lastTail = logs.stdout || logs.stderr || status.lastErrorTail || '';
   res.json({
     activeProfile: activeProfile(),
     streamUrl: STREAM_URL,
     status: {
-      running: !!status.running,
+      running: op25.running ?? !!status.running,
       locked: !!status.locked,
       lastDecodeTime: status.lastDecodeTime || null,
-      lastExitCode: status.lastExitCode ?? null,
+      lastExitCode: op25.lastExitCode ?? status.lastExitCode ?? null,
       lastStartCommand: status.lastStartCommand || null,
-      lastErrorTail: status.lastErrorTail || '',
+      lastErrorTail: lastTail,
       timestamp: status.timestamp || null,
       startedAt: status.startedAt || null,
       lastUpdated: status.lastUpdated || null,
