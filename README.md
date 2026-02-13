@@ -103,6 +103,25 @@ Common causes:
 - invalid profile command
 - `rx.py` path missing in image
 
+### Runner path-resolution verification (Meatboy4500)
+
+Use this checklist after runner updates:
+
+```bash
+cd /opt/stacks/rf-console
+docker compose build --no-cache op25
+docker compose up -d --force-recreate op25
+docker logs --tail 120 rf-console-op25
+```
+
+Expected startup logs include:
+- `[op25-runner] apps_dir=/op25/op25/gr-op25_repeater/apps` (on current image)
+- `[op25-runner] rx_py=/op25/op25/gr-op25_repeater/apps/rx.py`
+- `[op25-runner] command=... -w http://icecast:8000/stream ...`
+
+If `rx.py` is not found, runner exits cleanly with checked paths listed, for example:
+- `ERROR: rx.py not found. checked: /op25/.../rx.py, /opt/op25/.../rx.py, /opt/src/op25/.../rx.py`
+
 ### 3) No audio in player
 
 - verify Icecast is up:
