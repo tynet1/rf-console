@@ -24,8 +24,10 @@ const el = {
   lastExitCode: document.getElementById('lastExitCode'),
   updated: document.getElementById('updated'),
   op25ErrorTail: document.getElementById('op25ErrorTail'),
+  op25Hint: document.getElementById('op25Hint'),
   profileSelect: document.getElementById('profileSelect'),
   switchBtn: document.getElementById('switchBtn'),
+  restartOp25Btn: document.getElementById('restartOp25Btn'),
   adminToken: document.getElementById('adminToken'),
   saveTokenBtn: document.getElementById('saveTokenBtn'),
   checkControlBtn: document.getElementById('checkControlBtn'),
@@ -105,6 +107,12 @@ function appendOutput(text) {
 
 function renderHealth(servicePayload) {
   const checks = servicePayload.services || {};
+  const op25 = checks.op25;
+  if (op25 && op25.state !== 'running') {
+    el.op25Hint.textContent = 'OP25 is down. Check USB pass-through (/dev/bus/usb), profile trunk/tags files, and OP25 logs.';
+  } else {
+    el.op25Hint.textContent = '';
+  }
   el.healthGrid.innerHTML = '';
   Object.entries(checks).forEach(([name, infoRaw]) => {
     const info = {
@@ -155,6 +163,19 @@ async function refreshStatus() {
     el.audioPlayer.src = data.streamUrl;
   } catch (err) {
     appendOutput(`Status error: ${err.message}`);
+  }
+}
+
+async function refreshOp25LogsTail() {
+  try {
+    const logs = await fetchJson('/api/op25/logs-tail?lines=200');
+    if (logs.ok) {
+      setText(el.op25ErrorTail, logs.tail || '(no OP25 logs)');
+    } else {
+      setText(el.op25ErrorTail, logs.error || '(unable to read OP25 logs)');
+    }
+  } catch (err) {
+    setText(el.op25ErrorTail, `log tail error: ${err.message}`);
   }
 }
 
@@ -426,6 +447,20 @@ function bindEvents() {
     }
   });
 
+  el.restartOp25Btn.addEventListener('click', async () => {
+    if (!confirm('Restart OP25 container now?')) return;
+    try {
+      const resp = await fetchJson('/api/op25/restart', { method: 'POST' }, true);
+      appendOutput(`restart-op25 (exit ${resp.exitCode ?? 0})\\n${resp.stdout || ''}\\n${resp.stderr || ''}`);
+      if (resp.logsTail) {
+        setText(el.op25ErrorTail, resp.logsTail);
+      }
+      await refreshHealth();
+    } catch (err) {
+      appendOutput(`Restart OP25 failed: ${err.message}`);
+    }
+  });
+
   document.querySelectorAll('.actionBtn').forEach((btn) => {
     btn.addEventListener('click', () => doControlAction(btn.dataset.action));
   });
@@ -586,6 +621,8 @@ function bindEvents() {
   await loadProfiles();
   await refreshStatus();
   await refreshHealth();
+  await refreshOp25LogsTail();
   setInterval(refreshStatus, 3000);
   setInterval(refreshHealth, 4000);
+  setInterval(refreshOp25LogsTail, 4000);
 })();
