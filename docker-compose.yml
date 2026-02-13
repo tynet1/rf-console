@@ -13,10 +13,12 @@ services:
       - ICECAST_STATUS_URL=http://icecast:8000/status-json.xsl
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - CONTROL_PRIVATE_ONLY=${CONTROL_PRIVATE_ONLY:-1}
-      - HOST_HELPER_URL=${HOST_HELPER_URL:-}
+      - HOST_HELPER_URL=${HOST_HELPER_URL:-http://host.docker.internal:9911}
       - HOST_HELPER_TOKEN=${HOST_HELPER_TOKEN:-}
     volumes:
       - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   icecast:
     image: moul/icecast
@@ -27,6 +29,27 @@ services:
     volumes:
       - ./icecast/icecast.xml:/etc/icecast2/icecast.xml:ro
 
+  op25:
+    build:
+      context: ./op25/docker
+    container_name: rf-console-op25
+    restart: unless-stopped
+    depends_on:
+      - icecast
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - OP25_ACTIVE_PROFILE_FILE=/runtime/active-profile.json
+      - OP25_PROFILES_DIR=/config
+      - OP25_ICECAST_URL=http://icecast:8000/stream
+      - OP25_CWD=/opt/src/op25/op25/gr-op25_repeater/apps
+    volumes:
+      - ./data/profiles:/config:ro
+      - ./data/runtime:/runtime
+
+  # Optional legacy streamer path (ALSA/ffmpeg). Not required for OP25 direct-to-Icecast mode.
+  # You can disable this service by stopping it after startup:
+  #   docker compose stop streamer
   streamer:
     build:
       context: ./streamer
