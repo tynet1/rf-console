@@ -1,161 +1,132 @@
-# Meatboy4500 RF Console (rf-console)
+# rf-console (Meatboy4500)
 
-Mobile-first LAN UI for OP25 status, controls, imports, talkgroup filtering, and audio.
+rf-console now runs OP25 in Docker (direct to Icecast) to avoid Debian 13 / Python 3.13 host runtime issues (systemd pipe + stdio detach crashes).
 
-## Reliability architecture (new)
+## Legal note
 
-### OP25 supervisor logging and failure visibility
+- Decode/listen only to unencrypted traffic that is legal to monitor in your jurisdiction.
+- No RadioReference scraping is implemented.
+- Imports only use user-provided CSV/TSV/JSON files.
 
-`op25_supervisor.py` now launches OP25 child with:
-- `stdout=subprocess.PIPE`
-- `stderr=subprocess.STDOUT`
-- `text=True`
-- `bufsize=1`
+## Services
 
-No shell redirection is used.
-No raw `sys.stderr`/`FileIO` manipulation is used.
+`docker-compose.yml` includes:
+- `backend` (UI + API on `:8080`)
+- `icecast` (stream on `:8000`)
+- `op25` (`rf-console-op25`) direct source to Icecast
+- `streamer` (legacy optional ALSA/ffmpeg path; not required for OP25 direct mode)
 
-Supervisor behavior:
-- streams child output line-by-line
-- appends full child output to:
-  - `/opt/stacks/rf-console/data/runtime/op25-child.log`
-- keeps rolling last ~100 lines and writes to status:
-  - `lastErrorTail`
-- on child exit writes to `/opt/stacks/rf-console/data/runtime/op25-status.json`:
-  - `running=false`
-  - `lastExitCode`
-  - `lastErrorTail`
-  - `lastStartCommand`
-  - `timestamp`
+## Why Dockerized OP25
 
-### OP25 working directory
+Host/systemd OP25 on Debian 13 can fail with Python 3.13 stdio/pipe behavior. Moving OP25 to a pinned container runtime avoids that host mismatch.
 
-OP25 child is launched with explicit cwd:
-- `/opt/src/op25/op25/gr-op25_repeater/apps`
+## OP25 runtime files
 
-Configured via supervisor argument `--op25-cwd` (default above).
+- Active profile: `/opt/stacks/rf-console/data/runtime/active-profile.json`
+  - fallback supported: `active_profile.json`
+- Profiles: `/opt/stacks/rf-console/data/profiles`
+  - `<PROFILE>.profile.json`
+  - `<PROFILE>.trunk.tsv`
+  - `<PROFILE>.tags.tsv`
 
-### Active profile filename migration
+## OP25 container runner
 
-Canonical file:
-- `/opt/stacks/rf-console/data/runtime/active-profile.json`
+File:
+- `/opt/stacks/rf-console/op25/docker/op25_container_runner.py`
 
-Legacy file auto-migrated once if present:
-- `active_profile.json` -> `active-profile.json`
+Behavior:
+- reads active profile from runtime JSON
+- reads profile command
+- rewrites host paths to `/config`
+- enforces trunk path `/config/<PROFILE>.trunk.tsv`
+- strips ALSA output flags (`-O ...`)
+- enforces direct Icecast stream: `-w http://icecast:8000/stream`
+- validates `rx.py` exists in container before launch
+- logs resolved command to container logs
 
-## Security model for controls
-
-Control endpoints require `ADMIN_TOKEN`.
-
-- Send via `X-Admin-Token` header (UI stores token locally in browser).
-- Optional RFC1918 restriction via `CONTROL_PRIVATE_ONLY=1` (default).
-
-## Host helper (privileged commands)
-
-Backend container cannot directly execute host `systemctl/modprobe/lsusb` reliably.
-Use optional helper service:
-
-- Script: `/opt/stacks/rf-console/op25/host/rf_control_helper.py`
-- Unit: `/opt/stacks/rf-console/op25/host/rf-control-helper.service`
-
-Install:
-
-```bash
-cp /opt/stacks/rf-console/op25/host/rf-control-helper.env.example /opt/stacks/rf-console/op25/host/rf-control-helper.env
-# edit ADMIN_TOKEN, bind/port options
-sudo cp /opt/stacks/rf-console/op25/host/rf-control-helper.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rf-control-helper.service
-```
-
-Backend env (compose):
-- `ADMIN_TOKEN`
-- `HOST_HELPER_URL`
-- `HOST_HELPER_TOKEN`
-- `CONTROL_PRIVATE_ONLY`
-
-## API endpoints
-
-### Status and health
-
-- `GET /api/status`
-  - includes OP25 runtime/failure fields (`lastExitCode`, `lastErrorTail`, `lastStartCommand`, `timestamp`)
-- `GET /services`
-  - service status for:
-    - `op25-supervisor`
-    - `rf-control-helper`
-    - `icecast`
-    - `streamer`
-    - `rx.py`
-- `GET /api/health`
-  - compatibility/extended checks
-
-### Profile validation
-
-- `GET /api/validate-profile/:profile`
-
-Validation enforces:
-- `<PROFILE>.trunk.tsv` exists
-- referenced `*.tags.tsv` files exist
-- trunk file rows are quoted TSV format
-- consistent column count
-- returns first parse error clearly
-
-UI blocks `Start OP25` and `Restart OP25` when validation fails.
-
-### Controls and logs
-
-- `POST /api/control/action`
-- `GET /api/control/logs/:target`
-
-Actions include:
-- start/restart/stop OP25
-- load ALSA loopback
-- USB/SDR check
-- restart streamer/icecast
-- backend restart guidance
-
-### Imports
-
-- `POST /api/import/sites/:profile/preview`
-- `POST /api/import/sites/:profile/save`
-- `POST /api/import/talkgroups/:profile/preview`
-- `POST /api/import/talkgroups/:profile/save`
-- `POST /api/import/profile/:profile/from-json-file`
-- `GET /api/import/templates`
-
-CSV/TSV and JSON are user-supplied only. No scraping workflow is implemented.
-
-## Trunk/Tags file convention
-
-Enforced naming:
-- `<PROFILE>.trunk.tsv` = OP25 trunk config
-- `<PROFILE>.tags.tsv` = talkgroup labels
-
-Importer/write paths now generate these files to keep profile config consistent.
-
-## UI behavior
-
-- Health status lights source from `GET /services`.
-- Health tab shows OP25 error tail directly from `status.lastErrorTail`.
-- Controls tab has explicit profile validation button and blocks invalid starts.
-
-## Bring up
+## Deploy on Meatboy4500
 
 ```bash
 cd /opt/stacks/rf-console
 docker compose up -d --build
+docker compose ps
 ```
 
-UI:
-- `http://<LAN-IP>:8080`
+## Health / controls API
+
+- `GET /services`
+  - backend, icecast, streamer, op25 container state (status, uptime, lastExitCode)
+- `GET /api/validate-profile/:profile`
+- `POST /api/profiles/switch`
+  - validates profile files
+  - writes active profile
+  - restarts `rf-console-op25`
+- `POST /api/op25/restart`
+- `GET /api/op25/logs-tail`
+
+## UI behavior
+
+- Status lights use `/services`
+- Controls tab has `Restart OP25`
+- Health tab shows OP25 logs tail and actionable hint if OP25 is down
+
+## Backend Docker control requirements
+
+Backend needs Docker CLI and socket access:
+- backend image installs `docker.io` client
+- compose mounts `/var/run/docker.sock:/var/run/docker.sock`
+
+If Docker is unavailable in backend container, endpoints return actionable errors.
 
 ## Troubleshooting
 
-- If OP25 fails to start:
-  - open Health tab and review `OP25 Error Tail`
-  - validate profile via Controls -> `Validate Active Profile`
-  - check trunk/tags files exist and are quoted TSV
-- If service lights show helper unavailable:
-  - verify `rf-control-helper.service` active
-  - verify backend `HOST_HELPER_URL` and token match
+### 1) No RTL-SDR device found
+
+```bash
+lsusb | grep -Ei 'rtl|realtek'
+```
+
+Then verify compose device mapping:
+- `/dev/bus/usb:/dev/bus/usb`
+
+If needed, adjust udev rules/permissions on host.
+
+### 2) OP25 not starting
+
+```bash
+docker logs --tail 200 rf-console-op25
+```
+
+Common causes:
+- missing `/config/<PROFILE>.trunk.tsv`
+- missing `/config/<PROFILE>.tags.tsv`
+- invalid profile command
+- `rx.py` path missing in image
+
+### 3) No audio in player
+
+- verify Icecast is up:
+
+```bash
+docker logs --tail 200 rf-console-icecast
+```
+
+- verify OP25 uses `-w http://icecast:8000/stream` (runner enforces this)
+- test stream URL from iPad browser:
+  - `http://<meatboy-ip>:8000/stream`
+
+### 4) Check OP25 service state via API
+
+```bash
+curl -s http://<meatboy-ip>:8080/services | jq
+curl -s http://<meatboy-ip>:8080/api/op25/logs-tail | jq
+```
+
+## Local acceptance checklist
+
+1. `docker compose up -d --build` succeeds.
+2. `docker compose ps` shows `rf-console-op25` running.
+3. `docker logs rf-console-op25` shows OP25 startup + tuned command.
+4. UI shows OP25 service state and logs tail.
+5. Switch profile in UI and OP25 restarts cleanly.
+6. iPad plays `http://<meatboy-ip>:8000/stream`.
