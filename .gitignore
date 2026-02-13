@@ -16,3 +16,7 @@ coverage/
 
 # Runtime/state
 data/runtime/*
+
+# deps
+node_modules/
+ssh-ai-app/node_modules/
