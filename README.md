@@ -1,151 +1,128 @@
 # rf-console (Meatboy4500)
 
-rf-console now runs OP25 in Docker (direct to Icecast) to avoid Debian 13 / Python 3.13 host runtime issues (systemd pipe + stdio detach crashes).
+rf-console runs OP25 in Docker to avoid Debian 13 / Python 3.13 host runtime/systemd pipe instability.
 
 ## Legal note
 
-- Decode/listen only to unencrypted traffic that is legal to monitor in your jurisdiction.
+- Decode/listen only to unencrypted traffic you are legally allowed to monitor.
 - No RadioReference scraping is implemented.
 - Imports only use user-provided CSV/TSV/JSON files.
 
-## Services
+## Audio pipeline (stable mode)
 
-`docker-compose.yml` includes:
-- `backend` (UI + API on `:8080`)
-- `icecast` (stream on `:8000`)
-- `op25` (`rf-console-op25`) direct source to Icecast
-- `streamer` (legacy optional ALSA/ffmpeg path; not required for OP25 direct mode)
+Current stable audio path is:
 
-## Why Dockerized OP25
+`OP25 -> ALSA loopback -> streamer (ffmpeg) -> Icecast -> browser/iPad`
 
-Host/systemd OP25 on Debian 13 can fail with Python 3.13 stdio/pipe behavior. Moving OP25 to a pinned container runtime avoids that host mismatch.
+Important:
+- OP25 runner does **not** inject `-w http://...` into `rx.py`.
+- `-w` remains Wireshark-only behavior if profile command explicitly uses it.
+- Streamer is the component that pushes `/stream` to Icecast.
 
-## OP25 runtime files
+## Compose services
 
-- Active profile: `/opt/stacks/rf-console/data/runtime/active-profile.json`
-  - fallback supported: `active_profile.json`
-- Profiles: `/opt/stacks/rf-console/data/profiles`
-  - `<PROFILE>.profile.json`
-  - `<PROFILE>.trunk.tsv`
-  - `<PROFILE>.tags.tsv`
+- `backend` (`:8080`)
+- `icecast` (`:8000`)
+- `op25` (`rf-console-op25`)
+- `streamer` (`rf-console-streamer`)
 
-## OP25 container runner
+`op25` mounts:
+- `./data/profiles:/config:ro`
+- `./data/runtime:/runtime`
+- USB passthrough: `/dev/bus/usb:/dev/bus/usb`
+
+## OP25 runner
 
 File:
-- `/opt/stacks/rf-console/op25/docker/op25_container_runner.py`
+- `op25/docker/op25_container_runner.py`
 
-Behavior:
-- reads active profile from runtime JSON
-- reads profile command
-- rewrites host paths to `/config`
-- enforces trunk path `/config/<PROFILE>.trunk.tsv`
-- strips ALSA output flags (`-O ...`)
-- enforces direct Icecast stream: `-w http://icecast:8000/stream`
-- validates `rx.py` exists in container before launch
-- logs resolved command to container logs
+Runner behavior:
+- reads active profile from `/runtime/active-profile.json` (fallback `/runtime/active_profile.json`)
+- discovers `rx.py` by checking, in order:
+  1. `/op25/op25/gr-op25_repeater/apps/rx.py`
+  2. `/opt/op25/op25/gr-op25_repeater/apps/rx.py`
+  3. `/opt/src/op25/op25/gr-op25_repeater/apps/rx.py`
+- if not found, exits once with a clear error listing checked paths
+- normalizes trunk file to `/config/<PROFILE>.trunk.tsv` (fallback legacy `/config/<PROFILE>.tsv`)
+- ensures `-O` exists and defaults to `OP25_AUDIO_OUT` (`plughw:Loopback,0,0`)
+- removes accidental legacy URL argument after `-w` if present
+- does not internally restart-loop; exits with child exit code
 
-## Deploy on Meatboy4500
-
-```bash
-cd /opt/stacks/rf-console
-docker compose up -d --build
-docker compose ps
-```
-
-## Health / controls API
+## API highlights
 
 - `GET /services`
-  - backend, icecast, streamer, op25 container state (status, uptime, lastExitCode)
 - `GET /api/validate-profile/:profile`
 - `POST /api/profiles/switch`
-  - validates profile files
-  - writes active profile
-  - restarts `rf-console-op25`
 - `POST /api/op25/restart`
 - `GET /api/op25/logs-tail`
 
-## UI behavior
+## Hard reset (Meatboy4500)
 
-- Status lights use `/services`
-- Controls tab has `Restart OP25`
-- Health tab shows OP25 logs tail and actionable hint if OP25 is down
+```bash
+cd /opt/stacks/rf-console
+git reset --hard
+git clean -fd
+```
 
-## Backend Docker control requirements
+```bash
+sudo modprobe snd-aloop
+```
 
-Backend needs Docker CLI and socket access:
-- backend image installs `docker.io` client
-- compose mounts `/var/run/docker.sock:/var/run/docker.sock`
+```bash
+docker compose down
+docker compose build --no-cache op25 streamer backend
+docker compose up -d --force-recreate
+```
 
-If Docker is unavailable in backend container, endpoints return actionable errors.
+Verify:
+
+```bash
+docker compose ps
+docker logs --tail 120 rf-console-op25
+docker logs --tail 120 rf-console-streamer
+curl http://localhost:8000/stream -o /dev/null
+```
 
 ## Troubleshooting
 
-### 1) No RTL-SDR device found
+### OP25 restart-loop
+
+Check runner diagnostics:
+
+```bash
+docker logs --tail 120 rf-console-op25
+```
+
+Expected diagnostics include:
+- selected profile
+- `/config` and `/runtime` existence summary
+- selected `apps_dir` and `rx_py`
+- final command line
+
+If `rx.py` missing, error should list all checked locations and exit non-zero.
+
+### No RTL dongle detected
 
 ```bash
 lsusb | grep -Ei 'rtl|realtek'
 ```
 
-Then verify compose device mapping:
-- `/dev/bus/usb:/dev/bus/usb`
+Then confirm compose includes `/dev/bus/usb:/dev/bus/usb`.
 
-If needed, adjust udev rules/permissions on host.
-
-### 2) OP25 not starting
+### No audio
 
 ```bash
-docker logs --tail 200 rf-console-op25
+docker logs --tail 120 rf-console-streamer
+docker logs --tail 120 rf-console-icecast
 ```
 
-Common causes:
-- missing `/config/<PROFILE>.trunk.tsv`
-- missing `/config/<PROFILE>.tags.tsv`
-- invalid profile command
-- `rx.py` path missing in image
+Confirm iPad can open:
+- `http://<meatboy4500-ip>:8000/stream`
 
-### Runner path-resolution verification (Meatboy4500)
+## Acceptance checklist
 
-Use this checklist after runner updates:
-
-```bash
-cd /opt/stacks/rf-console
-docker compose build --no-cache op25
-docker compose up -d --force-recreate op25
-docker logs --tail 120 rf-console-op25
-```
-
-Expected startup logs include:
-- `[op25-runner] apps_dir=/op25/op25/gr-op25_repeater/apps` (on current image)
-- `[op25-runner] rx_py=/op25/op25/gr-op25_repeater/apps/rx.py`
-- `[op25-runner] command=... -w http://icecast:8000/stream ...`
-
-If `rx.py` is not found, runner exits cleanly with checked paths listed, for example:
-- `ERROR: rx.py not found. checked: /op25/.../rx.py, /opt/op25/.../rx.py, /opt/src/op25/.../rx.py`
-
-### 3) No audio in player
-
-- verify Icecast is up:
-
-```bash
-docker logs --tail 200 rf-console-icecast
-```
-
-- verify OP25 uses `-w http://icecast:8000/stream` (runner enforces this)
-- test stream URL from iPad browser:
-  - `http://<meatboy-ip>:8000/stream`
-
-### 4) Check OP25 service state via API
-
-```bash
-curl -s http://<meatboy-ip>:8080/services | jq
-curl -s http://<meatboy-ip>:8080/api/op25/logs-tail | jq
-```
-
-## Local acceptance checklist
-
-1. `docker compose up -d --build` succeeds.
-2. `docker compose ps` shows `rf-console-op25` running.
-3. `docker logs rf-console-op25` shows OP25 startup + tuned command.
-4. UI shows OP25 service state and logs tail.
-5. Switch profile in UI and OP25 restarts cleanly.
-6. iPad plays `http://<meatboy-ip>:8000/stream`.
+1. `docker compose ps` shows `rf-console-op25` as `Up` (not restarting).
+2. `docker logs rf-console-op25` does not show usage spam from invalid `-w http://...` args.
+3. `rf-console-streamer` is pushing to Icecast `/stream`.
+4. UI shows OP25 service status and log tail.
+5. iPad plays `http://<meatboy4500-ip>:8000/stream`.
