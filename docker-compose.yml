@@ -47,14 +47,12 @@ services:
     environment:
       - OP25_ACTIVE_PROFILE_FILE=/runtime/active-profile.json
       - OP25_PROFILES_DIR=/config
-      - OP25_ICECAST_URL=http://icecast:8000/stream
+      - OP25_AUDIO_OUT=plughw:Loopback,0,0
     volumes:
       - ./data/profiles:/config:ro
       - ./data/runtime:/runtime
 
-  # Optional legacy streamer path (ALSA/ffmpeg). Not required for OP25 direct-to-Icecast mode.
-  # You can disable this service by stopping it after startup:
-  #   docker compose stop streamer
+  # OP25 audio path: OP25 -> ALSA loopback -> streamer (ffmpeg) -> Icecast
   streamer:
     build:
       context: ./streamer
