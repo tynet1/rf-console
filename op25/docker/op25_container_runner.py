@@ -13,7 +13,7 @@ ACTIVE_PROFILE_FILES = [
 ]
 PROFILES_DIR = Path(os.environ.get("OP25_PROFILES_DIR", "/config"))
 RUNTIME_DIR = Path(os.environ.get("OP25_RUNTIME_DIR", "/runtime"))
-ICECAST_URL = os.environ.get("OP25_ICECAST_URL", "http://icecast:8000/stream").strip()
+OP25_AUDIO_OUT = os.environ.get("OP25_AUDIO_OUT", "plughw:Loopback,0,0").strip()
 
 APPS_DIR_CANDIDATES = [
     Path("/op25/op25/gr-op25_repeater/apps"),
@@ -65,10 +65,10 @@ def profile_doc(profile: str):
 def discover_apps_dir() -> tuple[Path, Path]:
     checked = []
     for apps_dir in APPS_DIR_CANDIDATES:
-        rx = apps_dir / "rx.py"
-        checked.append(str(rx))
-        if apps_dir.exists() and rx.exists():
-            return apps_dir, rx
+        rx_py = apps_dir / "rx.py"
+        checked.append(str(rx_py))
+        if apps_dir.exists() and rx_py.exists():
+            return apps_dir, rx_py
     raise RunnerError(f"rx.py not found. checked: {', '.join(checked)}")
 
 
@@ -79,7 +79,7 @@ def profile_command(profile: str, doc) -> list[str]:
     if isinstance(command, list) and command and all(isinstance(x, str) for x in command):
         return list(command)
 
-    # fallback minimal command (rx.py resolved later)
+    # Fallback command; rx.py path is injected after discovery.
     return [
         "python3",
         "rx.py",
@@ -105,82 +105,130 @@ def replace_host_paths(token: str) -> str:
     return token
 
 
-def normalize_command(profile: str, command: list[str], rx_py: Path) -> list[str]:
-    normalized = [replace_host_paths(t) for t in command]
+def candidate_trunk(profile: str) -> str:
+    trunk = PROFILES_DIR / f"{profile}.trunk.tsv"
+    legacy = PROFILES_DIR / f"{profile}.tsv"
+    if trunk.exists():
+        return str(trunk)
+    if legacy.exists():
+        return str(legacy)
+    return str(trunk)
 
-    # normalize legacy profile tsv references
-    normalized = [t.replace(f"{profile}.tsv", f"{profile}.trunk.tsv") for t in normalized]
+
+def ensure_tags_file(profile: str) -> str:
+    tags = PROFILES_DIR / f"{profile}.tags.tsv"
+    if tags.exists():
+        return str(tags)
+
+    runtime_tags = RUNTIME_DIR / f"{profile}.tags.tsv"
+    runtime_tags.parent.mkdir(parents=True, exist_ok=True)
+    if not runtime_tags.exists():
+        runtime_tags.write_text('"tgid"\t"tag"\t"mode"\n', encoding="utf-8")
+    return str(runtime_tags)
+
+
+def strip_alsa_device_tokens(tokens: list[str]) -> list[str]:
+    cleaned = []
+    for token in tokens:
+        low = token.lower()
+        if "plughw:" in low or low.startswith("hw:"):
+            continue
+        cleaned.append(token)
+    return cleaned
+
+
+def normalize_command(profile: str, command: list[str], rx_py: Path) -> list[str]:
+    tokens = [replace_host_paths(t) for t in command]
+
+    # normalize legacy profile tsv naming
+    tokens = [t.replace(f"{profile}.tsv", f"{profile}.trunk.tsv") for t in tokens]
 
     # force discovered rx.py path for any rx.py token
     rewritten = []
-    for token in normalized:
+    for token in tokens:
         if token.endswith("rx.py"):
             rewritten.append(str(rx_py))
         else:
             rewritten.append(token)
-    normalized = rewritten
+    tokens = rewritten
 
-    if not any(t.endswith("rx.py") for t in normalized):
-        if normalized and normalized[0].startswith("python"):
-            normalized.insert(1, str(rx_py))
+    # Ensure rx.py is present in argv.
+    if not any(t.endswith("rx.py") for t in tokens):
+        if tokens and tokens[0].startswith("python"):
+            tokens.insert(1, str(rx_py))
         else:
-            normalized.insert(0, str(rx_py))
+            tokens.insert(0, str(rx_py))
 
-    trunk_path = str(PROFILES_DIR / f"{profile}.trunk.tsv")
-    if not Path(trunk_path).exists():
-        raise RunnerError(f"required trunk file not found: {trunk_path}")
-
-    tags_path = str(PROFILES_DIR / f"{profile}.tags.tsv")
-    if not Path(tags_path).exists():
-        raise RunnerError(f"required tags file not found: {tags_path}")
-
-    # enforce -T trunk config
-    if "-T" in normalized:
-        i = normalized.index("-T")
-        if i + 1 < len(normalized):
-            normalized[i + 1] = trunk_path
+    # Force selected trunk path for -T.
+    trunk_path = candidate_trunk(profile)
+    if "-T" in tokens:
+        i = tokens.index("-T")
+        if i + 1 < len(tokens):
+            tokens[i + 1] = trunk_path
         else:
-            normalized.append(trunk_path)
+            tokens.append(trunk_path)
     else:
-        normalized.extend(["-T", trunk_path])
+        tokens.extend(["-T", trunk_path])
 
-    # strip ALSA output flags for direct Icecast mode
-    out = []
+    # Keep -w flag behavior for Wireshark, but remove legacy accidental URL argument.
+    cleaned = []
     skip_next = False
-    for token in normalized:
+    for i, token in enumerate(tokens):
         if skip_next:
             skip_next = False
             continue
-        if token == "-O":
-            skip_next = True
+        if token == "-w":
+            cleaned.append(token)
+            if i + 1 < len(tokens):
+                nxt = tokens[i + 1]
+                if nxt.startswith("http://") or nxt.startswith("https://"):
+                    skip_next = True
             continue
-        low = token.lower()
-        if "plughw:" in low or low.startswith("hw:"):
-            continue
-        out.append(token)
-    normalized = out
+        if token.startswith("http://") or token.startswith("https://"):
+            if "icecast" in token or token.endswith("/stream"):
+                continue
+        cleaned.append(token)
+    tokens = cleaned
 
-    # enforce direct Icecast output
-    if "-w" in normalized:
-        i = normalized.index("-w")
-        if i + 1 < len(normalized):
-            normalized[i + 1] = ICECAST_URL
+    # Keep ALSA audio out; ensure -O exists.
+    if "-O" in tokens:
+        i = tokens.index("-O")
+        if i + 1 < len(tokens):
+            tokens[i + 1] = OP25_AUDIO_OUT
         else:
-            normalized.append(ICECAST_URL)
+            tokens.append(OP25_AUDIO_OUT)
     else:
-        normalized.extend(["-w", ICECAST_URL])
+        tokens.extend(["-O", OP25_AUDIO_OUT])
 
-    return normalized
+    # If command had raw device tokens detached from -O, clear them to avoid confusion.
+    tokens = strip_alsa_device_tokens(tokens)
+    if "-O" in tokens:
+        i = tokens.index("-O")
+        if i + 1 >= len(tokens):
+            tokens.append(OP25_AUDIO_OUT)
+
+    # Touch/create tags file location so profile references are valid.
+    tags_path = ensure_tags_file(profile)
+    if "--tags-file" in tokens:
+        i = tokens.index("--tags-file")
+        if i + 1 < len(tokens):
+            tokens[i + 1] = tags_path
+        else:
+            tokens.append(tags_path)
+
+    return tokens
 
 
 def runtime_summary():
     config_exists = PROFILES_DIR.exists()
     runtime_exists = RUNTIME_DIR.exists()
-    profile_files = sorted(p.name for p in PROFILES_DIR.glob("*.profile.json"))[:8] if config_exists else []
+    profile_files = sorted(p.name for p in PROFILES_DIR.glob("*.profile.json"))[:10] if config_exists else []
+    trunk_files = sorted(p.name for p in PROFILES_DIR.glob("*.trunk.tsv"))[:10] if config_exists else []
     return {
         "config_exists": config_exists,
         "runtime_exists": runtime_exists,
-        "sample_profiles": profile_files,
+        "profile_files": profile_files,
+        "trunk_files": trunk_files,
     }
 
 
@@ -199,24 +247,22 @@ def main():
         apps_dir, rx_py = discover_apps_dir()
         cmd = normalize_command(profile, profile_command(profile, doc), rx_py)
 
-        launch = " ".join(shlex.quote(x) for x in cmd)
         rs = runtime_summary()
+        launch = " ".join(shlex.quote(x) for x in cmd)
 
         print(f"[op25-runner] profile={profile}", flush=True)
-        print(f"[op25-runner] config_dir={PROFILES_DIR} exists={rs['config_exists']}", flush=True)
-        print(f"[op25-runner] runtime_dir={RUNTIME_DIR} exists={rs['runtime_exists']}", flush=True)
-        print(f"[op25-runner] profile_files_sample={','.join(rs['sample_profiles']) if rs['sample_profiles'] else '(none)'}", flush=True)
+        print(f"[op25-runner] /config exists={rs['config_exists']} profiles={','.join(rs['profile_files']) if rs['profile_files'] else '(none)'}", flush=True)
+        print(f"[op25-runner] /runtime exists={rs['runtime_exists']}", flush=True)
+        print(f"[op25-runner] trunk sample={','.join(rs['trunk_files']) if rs['trunk_files'] else '(none)'}", flush=True)
         print(f"[op25-runner] apps_dir={apps_dir}", flush=True)
         print(f"[op25-runner] rx_py={rx_py}", flush=True)
         print(f"[op25-runner] command={launch}", flush=True)
 
         write_tail(
             f"profile={profile}\n"
-            f"config_dir={PROFILES_DIR}\n"
-            f"runtime_dir={RUNTIME_DIR}\n"
             f"apps_dir={apps_dir}\n"
             f"rx_py={rx_py}\n"
-            f"cmd={launch}\n"
+            f"command={launch}\n"
         )
 
         child = subprocess.Popen(
