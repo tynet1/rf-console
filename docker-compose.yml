@@ -2,6 +2,8 @@ services:
   backend:
     build:
       context: ./backend
+    env_file:
+      - .env
     container_name: rf-console-backend
     restart: unless-stopped
     ports:
@@ -37,6 +39,8 @@ services:
   op25:
     build:
       context: ./op25/docker
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: rf-console-op25:local
     container_name: rf-console-op25
     restart: unless-stopped

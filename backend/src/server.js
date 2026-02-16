@@ -350,6 +350,30 @@ function writeTagsTsv(profile, entries) {
   fs.writeFileSync(path.join(PROFILES_DIR, `${profile}.tags.tsv`), out.join('\n') + '\n', 'utf8');
 }
 
+function ensureNamedTagsFile(tagFileName) {
+  const safe = String(tagFileName || '').trim();
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(safe) || !safe.toLowerCase().endsWith('.tags.tsv')) {
+    throw new Error(`Invalid tags file name: ${tagFileName}`);
+  }
+  const full = path.join(PROFILES_DIR, safe);
+  if (!fs.existsSync(full)) {
+    fs.writeFileSync(full, '"tgid"\t"tag"\t"mode"\n', 'utf8');
+  }
+  return full;
+}
+
+function findCaseInsensitiveProfileFile(fileName) {
+  if (!fs.existsSync(PROFILES_DIR)) {
+    return null;
+  }
+  const target = String(fileName || '').toLowerCase();
+  if (!target) {
+    return null;
+  }
+  const match = fs.readdirSync(PROFILES_DIR).find((name) => name.toLowerCase() === target);
+  return match || null;
+}
+
 function ensureTagsFile(profile) {
   const tagsPath = path.join(PROFILES_DIR, `${profile}.tags.tsv`);
   if (fs.existsSync(tagsPath)) {
@@ -473,11 +497,13 @@ function migrateLegacyTrunkFile(profile) {
   }
 }
 
-function validateProfileFiles(profile) {
+function validateProfileFiles(profile, options = {}) {
+  const createMissingTags = !!options.createMissingTags;
   migrateLegacyTrunkFile(profile);
   ensureTagsFile(profile);
   const trunkFileName = `${profile}.trunk.tsv`;
   const trunkPath = path.join(PROFILES_DIR, trunkFileName);
+  const createdTagFiles = [];
 
   if (!fs.existsSync(trunkPath)) {
     return {
@@ -535,7 +561,24 @@ function validateProfileFiles(profile) {
     for (const tag of referencedTags) {
       const full = path.isAbsolute(tag) ? tag : path.join(PROFILES_DIR, tag);
       if (!fs.existsSync(full)) {
-        firstError = `Referenced tag file is missing: ${tag}`;
+        if (!path.isAbsolute(tag) && createMissingTags) {
+          try {
+            ensureNamedTagsFile(tag);
+            createdTagFiles.push(tag);
+            continue;
+          } catch (err) {
+            firstError = `Unable to create missing tag file '${tag}': ${err.message}`;
+            break;
+          }
+        }
+        const caseVariant = path.isAbsolute(tag) ? null : findCaseInsensitiveProfileFile(tag);
+        if (caseVariant) {
+          firstError = `Referenced tag file case mismatch: '${tag}' not found, but '${caseVariant}' exists`;
+        } else {
+          firstError = createMissingTags
+            ? `Referenced tag file is missing: ${tag}`
+            : `Referenced tag file is missing: ${tag} (re-run with ?createMissingTags=1 to create an empty file)`;
+        }
         break;
       }
     }
@@ -550,7 +593,8 @@ function validateProfileFiles(profile) {
       trunkFile: trunkFileName,
       parsedRows,
       expectedColumns: expectedCols,
-      referencedTagFiles: Array.from(referencedTags)
+      referencedTagFiles: Array.from(referencedTags),
+      createdTagFiles
     }
   };
 }
@@ -937,11 +981,31 @@ app.get('/api/validate-profile/:profile', (req, res) => {
   if (!isSafeProfileName(profile)) {
     return res.status(400).json({ ok: false, error: 'Invalid profile name' });
   }
-  const result = validateProfileFiles(profile);
+  const result = validateProfileFiles(profile, { createMissingTags: parseBool(req.query.createMissingTags) });
   if (!result.ok) {
     return res.status(400).json(result);
   }
   return res.json(result);
+});
+
+app.post('/api/profiles/:profile/tags/init', guardControl, (req, res) => {
+  const profile = req.params.profile;
+  if (!isSafeProfileName(profile)) {
+    return res.status(400).json({ ok: false, error: 'Invalid profile name' });
+  }
+  const requestedName = String(req.body?.tagFile || `${profile}.tags.tsv`).trim();
+  try {
+    const target = ensureNamedTagsFile(requestedName);
+    return res.json({
+      ok: true,
+      profile,
+      tagFile: path.basename(target),
+      path: target,
+      ts: nowIso()
+    });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
 });
 
 app.post('/api/profiles/switch', async (req, res) => {
@@ -1163,6 +1227,21 @@ app.get('/api/control/capabilities', guardControl, async (_req, res) => {
     helperReachable: helper.ok,
     helperError: helper.error || helper.data?.error || null
   });
+});
+
+app.get('/api/debug/helper', guardControl, async (_req, res) => {
+  const helper = await callHostHelper('GET', '/health');
+  const payload = {
+    ok: helper.ok,
+    ts: nowIso(),
+    helperConfigured: Boolean(HOST_HELPER_URL),
+    helperUrl: HOST_HELPER_URL || null,
+    helperTokenConfigured: Boolean(HOST_HELPER_TOKEN),
+    status: helper.status || null,
+    error: helper.error || helper.data?.error || null,
+    response: helper.data || null
+  };
+  return res.status(helper.ok ? 200 : 503).json(payload);
 });
 
 app.post('/api/control/action', guardControl, async (req, res) => {
