@@ -16,6 +16,11 @@ coverage/
 
 # Runtime/state
 data/runtime/*
+!data/runtime/.keep
+!data/runtime/README.md
+data/runtime/*.json
+data/profiles/*.trunk.tsv
+data/profiles/*.tags.tsv
 
 # deps
 node_modules/
