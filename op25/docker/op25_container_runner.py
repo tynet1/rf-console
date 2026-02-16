@@ -14,6 +14,7 @@ ACTIVE_PROFILE_FILES = [
 PROFILES_DIR = Path(os.environ.get("OP25_PROFILES_DIR", "/config"))
 RUNTIME_DIR = Path(os.environ.get("OP25_RUNTIME_DIR", "/runtime"))
 OP25_AUDIO_OUT = os.environ.get("OP25_AUDIO_OUT", "plughw:Loopback,0,0").strip()
+OP25_IMAGE_REVISION = os.environ.get("OP25_IMAGE_REVISION", "unknown").strip() or "unknown"
 
 APPS_DIR_CANDIDATES = [
     Path("/op25/op25/gr-op25_repeater/apps"),
@@ -251,6 +252,7 @@ def main():
         launch = " ".join(shlex.quote(x) for x in cmd)
 
         print(f"[op25-runner] profile={profile}", flush=True)
+        print(f"[op25-runner] revision={OP25_IMAGE_REVISION}", flush=True)
         print(f"[op25-runner] /config exists={rs['config_exists']} profiles={','.join(rs['profile_files']) if rs['profile_files'] else '(none)'}", flush=True)
         print(f"[op25-runner] /runtime exists={rs['runtime_exists']}", flush=True)
         print(f"[op25-runner] trunk sample={','.join(rs['trunk_files']) if rs['trunk_files'] else '(none)'}", flush=True)

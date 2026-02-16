@@ -31,6 +31,32 @@ Important:
 - `./data/runtime:/runtime`
 - USB passthrough: `/dev/bus/usb:/dev/bus/usb`
 
+`backend` networking for host helper:
+- `extra_hosts: host.docker.internal:host-gateway`
+- default helper URL: `http://host.docker.internal:9911`
+
+## Bootstrap (idempotent)
+
+Run once on a clean install (or rerun any time):
+
+```bash
+cd /opt/stacks/rf-console
+./scripts/bootstrap.sh
+```
+
+What it does:
+- creates/updates `.env`
+- generates `ADMIN_TOKEN` if missing
+- sets `HOST_HELPER_URL=http://host.docker.internal:9911`
+- sets `HOST_HELPER_TOKEN` to match `ADMIN_TOKEN`
+- writes `op25/host/rf-control-helper.env` with `HELPER_BIND=0.0.0.0`
+- installs/enables/restarts `rf-control-helper.service`
+- starts/rebuilds backend and tests helper reachability from inside the backend container
+
+Expected UI result:
+- Controls tab shows `helperConfigured=true`
+- Controls tab shows `helperReachable=true`
+
 ## OP25 runner
 
 File:
@@ -47,14 +73,53 @@ Runner behavior:
 - ensures `-O` exists and defaults to `OP25_AUDIO_OUT` (`plughw:Loopback,0,0`)
 - removes accidental legacy URL argument after `-w` if present
 - does not internally restart-loop; exits with child exit code
+- prints image revision from `OP25_IMAGE_REVISION` (built from `GIT_SHA`)
 
 ## API highlights
 
 - `GET /services`
 - `GET /api/validate-profile/:profile`
+- `GET /api/validate-profile/:profile?createMissingTags=1`
 - `POST /api/profiles/switch`
 - `POST /api/op25/restart`
 - `GET /api/op25/logs-tail`
+- `GET /api/debug/helper` (requires admin token)
+- `POST /api/profiles/:profile/tags/init` (requires admin token)
+
+## Git workflow (safe pulls)
+
+Recommended CLI flow before push/pull:
+
+```bash
+git fetch origin
+git status
+git pull --ff-only
+```
+
+If local commits diverge and you want to reset to remote main:
+
+```bash
+git fetch origin
+git reset --hard origin/main
+```
+
+Use feature branches for changes and avoid force-push unless you explicitly need to rewrite your own branch history.
+
+## Safe update helper
+
+Use `scripts/update.sh` on Meatboy4500:
+
+```bash
+cd /opt/stacks/rf-console
+./scripts/update.sh
+```
+
+Behavior:
+- shows dirty state (`git status --porcelain`)
+- if dirty: choose stash or discard flow
+- runs `git fetch origin && git pull --ff-only`
+- rebuilds/recreates OP25 with fresh image metadata (`GIT_SHA`)
+- prints running container/image/status plus OP25 log tail
 
 ## Hard reset (Meatboy4500)
 
@@ -83,6 +148,13 @@ docker logs --tail 120 rf-console-streamer
 curl http://localhost:8000/stream -o /dev/null
 ```
 
+To confirm which commit is running in OP25:
+
+```bash
+docker logs --tail 120 rf-console-op25 | grep -E '\\[op25-runner\\] revision='
+docker inspect rf-console-op25 --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+```
+
 ## Troubleshooting
 
 ### OP25 restart-loop
@@ -100,6 +172,19 @@ Expected diagnostics include:
 - final command line
 
 If `rx.py` missing, error should list all checked locations and exit non-zero.
+
+If helper is unreachable from backend:
+
+```bash
+curl -H "x-admin-token: $ADMIN_TOKEN" http://localhost:8080/api/debug/helper
+```
+
+Verify helper bind:
+
+```bash
+sudo systemctl status rf-control-helper.service --no-pager
+ss -ltnp | grep 9911
+```
 
 ### No RTL dongle detected
 
